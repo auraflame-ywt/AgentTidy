@@ -16,7 +16,7 @@
 | Phase 4：CLI Validation | 已完成（只读初版） | CLI 已提供版本化 JSON 契约、文本诊断、真实扫描与 12 个端到端 golden；清理与候选预览保留给 Phase 6/7。 |
 | Phase 5：GUI Read-only Experience | 已完成（只读初版） | Tauri 2 IPC + React 三视图（Overview / Sessions / Diagnostics）已接入 Application API；清理与候选预览保留给 Phase 6/7。 |
 | Phase 6：Cleanup Model | 已完成（framework-only 初版） | 清理领域模型、策略、重新验证、审计日志、IPC 与 GUI Review 视图已落地；三个 provider 均未产出 Cleanup Unit，真实清理归 Phase 7。 |
-| Phase 7：首个 Provider Cleanup Beta | 未开始 | 依赖 Phase 6 的安全模型与跨平台验证。 |
+| Phase 7：首个 Provider Cleanup Beta | 进行中 | Claude Code transcript FileSet Beta 已落地（安全文档 + 单元构建/校验 + 多路径回收站 + Operation guard + 生命周期策略）；Codex ProviderOperation 与 WorkBuddy 表契约未开始。 |
 | Phase 8：逐 Provider 扩展 | 未开始 | 按 Provider 分别通过安全门槛后推进。 |
 
 ## 已完成里程碑
@@ -110,9 +110,7 @@
   `format.ts` 收编四处重复的 `humanBytes`，三处时间戳改为按语言本地化格式。
   CLI 输出（`agenttidy.cli.v1` 自动化契约）永远英文。
 
-## 当前工作与已知问题
-
-### Phase 3：三个 Read-only Provider
+### Phase 3：三个 Read-only Provider（补记）
 
 - Codex 已接入 `AgentProviderAdapter`：发现共享的 CLI / Desktop 状态根，检查
   读取权限和运行信号，并从 rollout JSONL 的首条 `session_meta` 生成只读 Session
@@ -136,8 +134,6 @@
 - Claude Code Desktop 在 Windows 上发现为 `claude-code:desktop`，仅扫描
   `local-agent-mode-sessions` 中嵌入的 `.claude/projects` transcript 镜像；不读取
   VM 镜像、凭证、审计日志或用户输出目录。
-
-## 下一步
 
 ### Phase 4：CLI Validation（只读初版）
 
@@ -163,21 +159,63 @@
   CLI 汇总，作为 `Workspace / User / report-only` 资源独立统计；不会归入 Session
   或可回收空间。
 
-### Phase 7：首个 Provider Cleanup Beta（原 Phase 6 清理启用项）
+### Phase 7：首个 Provider Cleanup Beta（进行中）
 
-- 框架已就绪（Phase 6），启用真实清理需按 Provider 分别跨过门槛：
-  - 每个启用的资源类型先在 `docs/safety/` 起独立文档；
-  - Codex：session JSONL `FileSet` 与 `state_5.sqlite.threads` 行的协调
-    `ProviderOperation`；workspace 仍因 §2.3 保持 Blocked；
-  - Claude Code：transcript + 同名 side 目录的 `FileSet` 原子单元；
-  - WorkBuddy：先冻结 `sessions` 表契约再谈生命周期与单元；
-  - 启用 provider override `build_cleanup_units` / `validate_cleanup_unit`，
-    策略随之从 ReviewRequired 提升到 LowRisk 的 per-kind 规则；
-  - Operation guard（§12.1 跨进程锁）与多路径 `move_paths_to_trash`；
-  - 视觉沿用已落地的 §6.3 Review & Tidy + 顶部
-    “共发现 N.N GB / 已选 X.XX GB” 与 “立即清理”（见 memory 锚点），
-    按 §6.3 默认选中规则：`low-risk` 默认勾选、`review-required` 默认不选、
-    `blocked` 不可选。
+已完成（第一阶段：Claude Code transcript FileSet Beta）：
+
+- 资源类型安全文档 `docs/safety/session-transcript-fileset.md`（先文档后
+  启用，满足 AGENTS.md 红线）：单元构成、永不入单元的清单、Trash/恢复
+  边界、7 条 §12.2 前置触发器、§16.1 路径安全、并发与审计约定。
+- Claude Code `build_cleanup_units`：每个已识别、独占的 Session 资源产出
+  一个 `FileSet` 单元（transcript + 同名 side 目录），transcript 携带
+  identity/size/mtime 指纹；无法指纹化的资源保持 report-only。
+- `validate_cleanup_unit(unit, installation)`（契约签名变更）：§16.1 校验
+  ——canonicalize 后必须落在 installation data roots 内（symlink 逃逸拒绝）、
+  成员共享同一 project 目录、布局必须是已验证的 `projects/<slug>/`；
+  计划构建时调用，校验失败使 plan 构建失败（fail-closed）。
+- Application 策略落地 §11.1/§11.2 生命周期规则：Active/Unknown →
+  Blocked；`Archived + inactive > 30d + exclusive + recoverable` →
+  LowRisk（唯一晋升路径）；Inactive / 近期 Archived → ReviewRequired；
+  无快照链接、非独占、带依赖 → Blocked。
+- 执行器：§12.1 跨进程 Operation guard（`$HOME/.agenttidy/operations.lock`，
+  阈值 10 分钟的 stale-lock 接管保障崩溃恢复）；`move_paths_to_trash`
+  多路径移动 + §12.3 部分失败诚实聚合（moved 计数 + 原文错误，永不误报
+  成功/丢失）；审计日志记录完整 `file-set` locator 与
+  `estimated_reclaimable_bytes`。
+- `CleanupUnit`/`CleanupItem` 新增 typed `CleanupLocator` 与
+  `estimated_reclaimable_bytes`，GUI 字节统计改用单元估算（FileSet 含
+  side 目录），行内显示 `+N` 成员数。
+- 测试：策略 10 项（三个风险等级 + 各阻断规则）、聚合 3 项、FileSet
+  重验证、端到端执行（含审计行 + 幂等重跑）、Operation guard 4 项、
+  provider 契约 5 项（含 symlink 逃逸与布局拒绝）。
+- §6.3 Review & Tidy 体验闭环（GUI）：行级展示补齐操作方式
+  （Move to Trash / Agent 专属操作）、可恢复性（系统回收站可恢复 / 不可）
+  与 `file-set` 成员路径展开列表；选择规则加固——blocked 在状态层拒绝
+  选择（不只靠 disabled checkbox）、stale（changed）行在重新验证时自动
+  移出选择、执行后清空选择并要求重新扫描；计划过期（5 分钟 TTL）在
+  两个 CTA 与点击时实时拦截并显示“计划已过期，请重新扫描”。
+- TTL 后端强化（fail-closed 修复）：`cleanup_revalidate` 对过期计划的
+  每一项报 `skipped`，`cleanup_execute` 直接拒绝执行，堵住裸 IPC 绕过
+  GUI 过期门禁的口子（§12.2）。
+
+## 下一步
+
+### Phase 7 后续切片
+
+- Codex session JSONL `FileSet` 与 `state_5.sqlite.threads` 行的协调
+  `ProviderOperation`（含 §12.4 数据库操作纪律）；workspace 仍因 §2.3
+  保持 Blocked；
+- WorkBuddy：先冻结 `sessions` 表契约再谈生命周期与单元；
+- Windows 锁定文件的 `skipped` vs `failed` 错误码分类（需可靠 OS 错误
+  码，当前按原文报 failed）；
+- 小范围真实用户 Beta 与 Trash/Recovery/Compatibility 跨平台验证
+  （Start.md §19 Phase 7 验收项）。
+
+### Phase 8：逐 Provider 扩展（待启动）
+
+每个 Provider 独立通过安全门槛后开放 Cleanup（Start.md §19）；
+资源级启用流程沿用 Phase 7 的模板：先 `docs/safety/` 文档，再
+`build_cleanup_units` / `validate_cleanup_unit`，最后策略 per-kind 提权。
 
 ### 验证前置问题
 

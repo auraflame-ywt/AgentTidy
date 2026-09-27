@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase 7 first cleanup slice — Claude Code transcript `FileSet` beta.**
+  `build_cleanup_units` / `validate_cleanup_unit` now emit and validate
+  atomic trash units (transcript + same-named side directory) for
+  recognized, exclusively-owned sessions, gated by the new
+  `docs/safety/session-transcript-fileset.md`; unrecognized/mismatched
+  transcripts never form units, and Codex / WorkBuddy remain report-only
+  behind their own Phase 7 gates. Supporting pieces: multi-path
+  `trash::move_paths_to_trash` with honest §12.3 partial-failure
+  aggregation; the §12.1 cross-process operation guard
+  (`$HOME/.agenttidy/operations.lock`, stale-lock takeover for crash
+  recovery); `validate_cleanup_unit` now takes the installation so
+  §16.1 containment (canonicalized data-root boundaries, symlink-escape
+  rejection, verified `projects/<slug>/` layout) is actually enforceable;
+  `CleanupUnit`/`CleanupItem` carry a typed `CleanupLocator` (the full
+  `FileSet` path set travels to the executor and audit log) plus
+  `estimated_reclaimable_bytes` (the GUI byte totals now use the unit
+  estimate instead of the primary member's fingerprint size).
+- Typed §11.1/§11.2 lifecycle rules in `cleanup_policy_evaluate`:
+  Active/Unknown sessions are Blocked, `Archived + inactive > 30d +
+  exclusive + recoverable` is the single LowRisk path (recommended), and
+  Inactive / recently-archived units stay ReviewRequired — units without
+  snapshot linkage, non-exclusive ownership or dependencies are Blocked
+  (§7.3 / §9.5).
+- §6.3 Review & Tidy completeness + selection-rule hardening (GUI):
+  every plan row now shows its operation mode (Move to Trash / Provider
+  operation), recoverability (system-trash recoverable vs not) and the
+  contained member paths of a `file-set` unit; blocked rows are
+  non-selectable at the state layer (not just the checkbox), stale
+  (changed) rows drop out of the selection at revalidation as the copy
+  promises, and the view is reset after execution so the next run
+  requires a fresh preview. Plan expiry (5-min TTL) now gates both CTAs
+  with a "plan expired — rescan" notice, checked live at click time.
+
+### Fixed
+
+- The cleanup executor now actually enforces the plan TTL it documents:
+  `cleanup_revalidate` marks every item of an expired plan `skipped` and
+  `cleanup_execute` refuses to run it ("plan expired — rescan"), closing
+  the gap where a stale plan could still execute via raw IPC despite
+  `Start.md` §12.2.
+
 - Desktop application icon: a reproducible 1024×1024 source icon
   (`apps/desktop/assets/app-icon.png`, drawn by
   `apps/desktop/assets/generate_app_icon.py`) — rounded teal→emerald plate with
