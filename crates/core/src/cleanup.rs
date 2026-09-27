@@ -1,11 +1,16 @@
 //! Cleanup model — `Start.md` §11 (Cleanup Policy), §12 (CleanupPlan &
-//! execution protocol), §16.3 (audit log). Phase 6 ships the *framework*:
-//! types, provider contract additions, Application API surface and the
-//! IPC + GUI plumbing. No provider returns real cleanup units yet —
-//! per `docs/safety/workspace-cleanup.md:13-15` and `Start.md` §2.3,
+//! execution protocol), §16.3 (audit log). Phase 6 shipped the
+//! *framework*: types, provider contract additions, Application API
+//! surface and the IPC + GUI plumbing.
+//!
+//! Phase 7 enables cleanup per resource type, each behind its own
+//! safety doc. Today only the Claude Code transcript `FileSet` is
+//! enabled (`docs/safety/session-transcript-fileset.md`); Codex and
+//! WorkBuddy still return no units — per
+//! `docs/safety/workspace-cleanup.md:13-15` and `Start.md` §2.3,
 //! `~/Documents/Codex/` is user-mixed and Codex session JSONLs leave
-//! orphan rows in `state_5.sqlite.threads`; those land in Phase 7 with
-//! per-resource-type safety docs.
+//! orphan rows in `state_5.sqlite.threads`; those land in later Phase 7
+//! slices with their own per-resource-type safety docs.
 
 use crate::provider::ProviderId;
 use crate::resource::{ResourceKind, ResourceRef};
@@ -161,6 +166,11 @@ pub struct CleanupUnit {
     pub resources: Vec<ResourceRef>,
     pub estimated_reclaimable_bytes: u64,
     pub fingerprint: ResourceFingerprint,
+    /// Where the artifact(s) live — the typed path set the executor
+    /// operates on and the audit log records. `FileSet` carries *all*
+    /// member paths (e.g. transcript + same-named side directory), not
+    /// just the primary fingerprinted one.
+    pub locator: CleanupLocator,
     pub preconditions: Vec<CleanupPrecondition>,
     pub operation: CleanupOperation,
     /// Resource kind this unit summarizes (informational for grouping +
@@ -192,6 +202,13 @@ pub struct CleanupItem {
     pub installation_id: String,
     pub provider: ProviderId,
     pub fingerprint: ResourceFingerprint,
+    /// Denormalized from the unit so the executor trashes / records the
+    /// *whole* artifact without re-scanning (a `FileSet` item must move
+    /// every member path, §9.5 atomicity).
+    pub locator: CleanupLocator,
+    /// Denormalized from the unit — the plan's honest reclaim estimate,
+    /// also recorded as `reclaimed_bytes` on success (§16.3).
+    pub estimated_reclaimable_bytes: u64,
     pub action: CleanupAction,
     pub risk: RiskLevel,
     pub reasons: Vec<String>,
@@ -299,6 +316,17 @@ impl CleanupLocator {
             CleanupLocator::File { path } | CleanupLocator::Dir { path } => path,
             CleanupLocator::FileSet { paths } => paths.first().expect("non-empty file set"),
             CleanupLocator::DbRow { database, .. } => database,
+        }
+    }
+
+    /// Every path this locator covers. The executor moves *all* members
+    /// of a `FileSet` as one unit (§9.5 atomicity) and the revalidator
+    /// checks each one still exists (§12.2 "path changed").
+    pub fn paths(&self) -> Vec<&PathBuf> {
+        match self {
+            CleanupLocator::File { path } | CleanupLocator::Dir { path } => vec![path],
+            CleanupLocator::FileSet { paths } => paths.iter().collect(),
+            CleanupLocator::DbRow { database, .. } => vec![database],
         }
     }
 }

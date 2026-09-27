@@ -8,12 +8,15 @@
 
 use agenttidy_core::{
     AgentCapabilities, AgentInstallation, AgentSnapshot, CapabilityStatus, CapabilityTopic,
-    CleanupPrecondition, CleanupUnit, InstallationStatus, ManagedBy, Ownership, Platform,
-    ProjectRef, ProviderId, Resource, ResourceId, ResourceKind, ResourceLocator, ResourceRef,
-    ScanOptions, ScanProblem, Session, SessionId, SessionLifecycle, SizeConfidence, SizeInfo,
+    CleanupAction, CleanupLocator, CleanupOperation, CleanupPrecondition, CleanupPreconditionKind,
+    CleanupUnit, CleanupUnitKind, FileIdentity, InstallationStatus, ManagedBy, Ownership, Platform,
+    ProjectRef, ProviderId, Resource, ResourceFingerprint, ResourceId, ResourceKind,
+    ResourceLocator, ResourceRef, ScanOptions, ScanProblem, Session, SessionId, SessionLifecycle,
+    SizeConfidence, SizeInfo,
 };
 use agenttidy_infrastructure::disk_usage::UsageAccumulator;
-use agenttidy_infrastructure::fs_probe::{walk_tree, EntryKind, WalkProblem};
+use agenttidy_infrastructure::fs_probe::{file_identity, walk_tree, EntryKind, WalkProblem};
+use agenttidy_infrastructure::paths::{has_reserved_component, is_within, safe_canonicalize};
 use agenttidy_infrastructure::processes::{any_process_running, ProcessSignature};
 use agenttidy_provider_api::{AgentProviderAdapter, ProviderInspection};
 use serde::Deserialize;
@@ -510,26 +513,196 @@ impl AgentProviderAdapter for ClaudeCodeAdapter {
         })
     }
 
-    /// Phase 6: no cleanup units yet. Claude Code transcripts + sidecar
-    /// dirs stay report-only until the Phase 7 provider beta wires the
-    /// `FileSet` unit shape (`*.jsonl` + same-named side directory as one
-    /// atomic unit) with its safety doc. The Windows Desktop VM-mirror
-    /// installation stays out of scope entirely (`Start.md` §2.3).
+    /// Phase 7 beta: transcript `FileSet` cleanup units
+    /// (`docs/safety/session-transcript-fileset.md`).
+    ///
+    /// One unit per recognized, exclusively-owned session resource: the
+    /// transcript `*.jsonl` plus its same-named side directory — exactly
+    /// the file set the scan already measured (§9.5 atomicity). Structural
+    /// facts only: which sessions *should* be cleaned is the policy's
+    /// decision (§10). Unrecognized / mismatched transcripts stay
+    /// report-only and never form units (§3.2 + §7.3).
     async fn build_cleanup_units(
         &self,
         snapshot: &AgentSnapshot,
     ) -> anyhow::Result<Vec<CleanupUnit>> {
-        let _ = snapshot;
-        Ok(Vec::new())
+        let mut units = Vec::new();
+        for resource in &snapshot.resources {
+            if resource.kind != ResourceKind::Session || resource.ownership != Ownership::Exclusive
+            {
+                continue;
+            }
+            let Some(session_id) = &resource.session_id else {
+                continue;
+            };
+            let ResourceLocator::FileSet { paths } = &resource.locator else {
+                continue;
+            };
+            let Some(primary) = paths.first().map(PathBuf::from) else {
+                continue;
+            };
+            // The transcript (primary path) carries the §12.2
+            // fingerprint: identity + size + mtime. A path that cannot be
+            // fingerprinted cannot be safely revalidated later, so its
+            // resource stays report-only (fail-closed).
+            let Ok(metadata) = fs::symlink_metadata(&primary) else {
+                continue;
+            };
+            let Some(identity) = file_identity(&primary) else {
+                continue;
+            };
+            let mtime_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|since_epoch| since_epoch.as_millis() as i64)
+                .unwrap_or(0);
+            units.push(CleanupUnit {
+                id: format!(
+                    "{}:session:{}",
+                    snapshot.installation.id,
+                    session_id.as_str()
+                ),
+                provider: ProviderId::new(ProviderId::CLAUDE_CODE),
+                installation_id: snapshot.installation.id.clone(),
+                kind: CleanupUnitKind::FileSet,
+                resources: vec![ResourceRef {
+                    id: resource.id.clone(),
+                    kind: resource.kind,
+                }],
+                estimated_reclaimable_bytes: resource.size.logical_bytes,
+                fingerprint: ResourceFingerprint {
+                    path: primary,
+                    identity: FileIdentity {
+                        volume: identity.volume,
+                        index: identity.index,
+                    },
+                    size_bytes: metadata.len(),
+                    mtime_ms,
+                },
+                locator: CleanupLocator::FileSet {
+                    paths: paths.iter().map(PathBuf::from).collect(),
+                },
+                preconditions: Self::fileset_preconditions(),
+                operation: CleanupOperation {
+                    action: CleanupAction::Trash,
+                },
+                resource_kind: ResourceKind::Session,
+            });
+        }
+        Ok(units)
     }
 
-    /// Phase 6: no units, no provider-specific preconditions.
+    /// §16.1 path safety for a transcript file set: every member path
+    /// must canonicalize inside the installation's data roots (no symlink
+    /// escapes), keep the verified `projects/<slug>/` layout shared by CLI
+    /// transcripts and Desktop mirrors, and share one project directory
+    /// (transcript + side directory). Rejects empty / reserved / over-broad
+    /// paths. Returns the typed §12.2 preconditions the revalidator must
+    /// check before executing.
     async fn validate_cleanup_unit(
         &self,
         unit: &CleanupUnit,
+        installation: &AgentInstallation,
     ) -> anyhow::Result<Vec<CleanupPrecondition>> {
-        let _ = unit;
-        Ok(Vec::new())
+        let CleanupLocator::FileSet { paths } = &unit.locator else {
+            anyhow::bail!("claude-code cleanup units must be FileSet locators");
+        };
+        let Some(primary) = paths.first() else {
+            anyhow::bail!("empty file set");
+        };
+        let Some(shared_dir) = primary.parent() else {
+            anyhow::bail!(
+                "file set path has no parent directory: {}",
+                primary.display()
+            );
+        };
+        let roots = installation
+            .data_roots
+            .iter()
+            .map(|root| safe_canonicalize(Path::new(root)))
+            .collect::<Result<Vec<_>, _>>()?;
+        for path in paths {
+            if path.as_os_str().is_empty() {
+                anyhow::bail!("empty path in file set");
+            }
+            if has_reserved_component(path) {
+                anyhow::bail!("reserved path component in file set: {}", path.display());
+            }
+            if path.parent() != Some(shared_dir) {
+                anyhow::bail!(
+                    "file set members must share one project directory (transcript + side directory): {}",
+                    path.display()
+                );
+            }
+            // Canonicalize first: a member that is a symlink pointing out
+            // of the data root lands outside `roots` and is rejected
+            // (§16.1 "不跟随指向数据根目录之外的 Symlink").
+            let canonical = safe_canonicalize(path).map_err(|error| {
+                anyhow::anyhow!("cannot canonicalize {}: {error}", path.display())
+            })?;
+            if !roots.iter().any(|root| is_within(root, &canonical)) {
+                anyhow::bail!("unit path escapes provider data roots: {}", path.display());
+            }
+        }
+        // Layout invariant: transcripts live at `<root>/projects/<slug>/`
+        // for both the CLI installation and the Desktop mirrors — a shared
+        // dir whose parent is not `projects` is not a verified transcript
+        // location and must not be cleaned.
+        let inside_projects = shared_dir.parent().and_then(|parent| parent.file_name())
+            == Some(std::ffi::OsStr::new("projects"));
+        if !inside_projects {
+            anyhow::bail!(
+                "file set is not inside a verified projects/<slug>/ directory: {}",
+                shared_dir.display()
+            );
+        }
+        Ok(unit.preconditions.clone())
+    }
+}
+
+impl ClaudeCodeAdapter {
+    /// §12.2 invalidation triggers for a transcript file set
+    /// (`docs/safety/session-transcript-fileset.md`). `MtimeUnchanged`
+    /// doubles as the session-re-activation trigger: a session that
+    /// becomes active writes its transcript, so its mtime moves.
+    fn fileset_preconditions() -> Vec<CleanupPrecondition> {
+        [
+            (
+                CleanupPreconditionKind::PathExists,
+                "transcript and side directory still exist",
+            ),
+            (
+                CleanupPreconditionKind::PathUnchanged,
+                "paths canonicalize to the scanned locations (§16.1)",
+            ),
+            (
+                CleanupPreconditionKind::IdentityUnchanged,
+                "transcript file identity unchanged",
+            ),
+            (
+                CleanupPreconditionKind::SizeUnchanged,
+                "transcript size unchanged",
+            ),
+            (
+                CleanupPreconditionKind::MtimeUnchanged,
+                "transcript mtime unchanged (session-re-activation signal)",
+            ),
+            (
+                CleanupPreconditionKind::NoAgentRunning,
+                "no Claude process running (§16.2)",
+            ),
+            (
+                CleanupPreconditionKind::SessionInactive,
+                "owning session still Inactive/Archived (§11)",
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, description)| CleanupPrecondition {
+            kind,
+            description: description.into(),
+        })
+        .collect()
     }
 }
 
@@ -626,6 +799,202 @@ mod tests {
         );
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].kind, ResourceKind::Unknown);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 7 cleanup-unit contract (§9.5 + §16.1 + §12.2).
+    // -----------------------------------------------------------------
+
+    /// Snapshot assembled the way `scan` assembles it, from the temp
+    /// fixture tree — kept sync so the async tests stay small.
+    fn snapshot_of(root: &Path) -> AgentSnapshot {
+        let installation = installation(root);
+        let (sessions, resources, problems) =
+            ClaudeCodeAdapter::scan_projects(root, &installation, false, &ScanOptions::default());
+        AgentSnapshot {
+            installation,
+            sessions,
+            resources,
+            problems,
+            completed_at: 0,
+        }
+    }
+
+    fn write_session_fixture(root: &Path) -> String {
+        let project = root.join("projects/example-project");
+        let id = "1d9d0f1e-5a1c-4d0c-9c0b-1a2b3c4d5e6f".to_string();
+        fs::write(
+            project.join(format!("{id}.jsonl")),
+            format!("{{\"sessionId\":\"{id}\"}}\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(project.join(&id).join("subagents")).unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn build_cleanup_units_forms_one_fileset_unit_per_session_resource() {
+        let root = temp_root();
+        let id = write_session_fixture(&root);
+        let project = root.join("projects/example-project");
+        let snapshot = snapshot_of(&root);
+
+        let units = ClaudeCodeAdapter
+            .build_cleanup_units(&snapshot)
+            .await
+            .expect("units build");
+        assert_eq!(units.len(), 1);
+        let unit = &units[0];
+        // §9.5: one atomic FileSet unit per session, trash-first.
+        assert_eq!(unit.kind, CleanupUnitKind::FileSet);
+        assert_eq!(unit.operation.action, CleanupAction::Trash);
+        assert_eq!(unit.resource_kind, ResourceKind::Session);
+        assert_eq!(
+            unit.estimated_reclaimable_bytes,
+            snapshot.resources[0].size.logical_bytes
+        );
+        // The whole measured file set travels in the locator: transcript
+        // + same-named side directory.
+        assert_eq!(unit.locator.paths().len(), 2);
+        // The fingerprint is taken from the transcript (primary member).
+        assert_eq!(unit.fingerprint.path, project.join(format!("{id}.jsonl")));
+        assert!(unit.fingerprint.size_bytes > 0);
+        assert!(unit
+            .preconditions
+            .iter()
+            .any(|p| p.kind == CleanupPreconditionKind::NoAgentRunning));
+        assert!(unit
+            .preconditions
+            .iter()
+            .any(|p| p.kind == CleanupPreconditionKind::MtimeUnchanged));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unrecognized_transcripts_never_form_units() {
+        // §3.2 + §7.3: unknown / mismatched transcripts stay report-only.
+        let root = temp_root();
+        fs::write(
+            root.join("projects/example-project/not-the-session-id.jsonl"),
+            "{\"sessionId\":\"actual-id\"}\n",
+        )
+        .unwrap();
+        let snapshot = snapshot_of(&root);
+        let units = ClaudeCodeAdapter
+            .build_cleanup_units(&snapshot)
+            .await
+            .expect("units build");
+        assert!(units.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_verified_layout_and_declares_preconditions() {
+        let root = temp_root();
+        write_session_fixture(&root);
+        let snapshot = snapshot_of(&root);
+        let units = ClaudeCodeAdapter
+            .build_cleanup_units(&snapshot)
+            .await
+            .expect("units build");
+
+        let preconditions = ClaudeCodeAdapter
+            .validate_cleanup_unit(&units[0], &snapshot.installation)
+            .await
+            .expect("verified layout validates");
+        assert!(preconditions
+            .iter()
+            .any(|p| p.kind == CleanupPreconditionKind::PathUnchanged));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_paths_outside_the_data_root() {
+        // §16.1: a unit may never reach outside the provider data root.
+        let root = temp_root();
+        write_session_fixture(&root);
+        let outside = std::env::temp_dir().join(format!(
+            "agenttidy-claude-outside-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&outside, b"x").unwrap();
+        let snapshot = snapshot_of(&root);
+        let mut units = ClaudeCodeAdapter
+            .build_cleanup_units(&snapshot)
+            .await
+            .expect("units build");
+        units[0].locator = CleanupLocator::FileSet {
+            paths: vec![outside.clone()],
+        };
+
+        let error = ClaudeCodeAdapter
+            .validate_cleanup_unit(&units[0], &snapshot.installation)
+            .await
+            .expect_err("outside-root path must be rejected");
+        assert!(error.to_string().contains("escapes provider data roots"));
+        fs::remove_file(&outside).ok();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// §16.1 symlink rule: a member symlinked out of the data root
+    /// canonicalizes outside and must be rejected. Unix-only — Windows
+    /// symlink creation needs privileges the CI runner may not have.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validate_rejects_symlink_escapes() {
+        let root = temp_root();
+        write_session_fixture(&root);
+        let outside = std::env::temp_dir().join(format!(
+            "agenttidy-claude-outside-link-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&outside, b"x").unwrap();
+        let link = root.join("projects/example-project/link.jsonl");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let snapshot = snapshot_of(&root);
+        let mut units = ClaudeCodeAdapter
+            .build_cleanup_units(&snapshot)
+            .await
+            .expect("units build");
+        units[0].locator = CleanupLocator::FileSet { paths: vec![link] };
+
+        let error = ClaudeCodeAdapter
+            .validate_cleanup_unit(&units[0], &snapshot.installation)
+            .await
+            .expect_err("symlink escape must be rejected");
+        assert!(error.to_string().contains("escapes provider data roots"));
+        fs::remove_file(&outside).ok();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_layout_outside_projects() {
+        // Layout invariant: only `<root>/projects/<slug>/` is a verified
+        // transcript location (both CLI and Desktop mirrors).
+        let root = temp_root();
+        write_session_fixture(&root);
+        let stray = root.join("other/stray.jsonl");
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(&stray, b"x").unwrap();
+        let snapshot = snapshot_of(&root);
+        let mut units = ClaudeCodeAdapter
+            .build_cleanup_units(&snapshot)
+            .await
+            .expect("units build");
+        units[0].locator = CleanupLocator::FileSet { paths: vec![stray] };
+
+        let error = ClaudeCodeAdapter
+            .validate_cleanup_unit(&units[0], &snapshot.installation)
+            .await
+            .expect_err("non-projects layout must be rejected");
+        assert!(error.to_string().contains("projects"));
         fs::remove_dir_all(root).unwrap();
     }
 }

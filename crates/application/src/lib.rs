@@ -11,24 +11,29 @@ use agenttidy_claude_code::ClaudeCodeAdapter;
 use agenttidy_codex::CodexAdapter;
 use agenttidy_core::{
     AgentCapabilities, AgentInstallation, AgentSnapshot, CleanupAction, CleanupDecision,
-    CleanupEvent, CleanupItem, CleanupItemOutcome, CleanupLocator, CleanupOutcome, CleanupPlan,
-    CleanupPreconditionKind, CleanupRevalidationOutcome, CleanupUnit, CleanupUnitKind,
-    Platform as CorePlatform, ProviderId, ProviderRegistry, ResourceKind, RiskLevel, RiskSummary,
-    ScanOptions,
+    CleanupEvent, CleanupItem, CleanupItemOutcome, CleanupOutcome, CleanupPlan,
+    CleanupPreconditionKind, CleanupRevalidationOutcome, CleanupUnit, CleanupUnitKind, Ownership,
+    Platform as CorePlatform, ProviderId, ProviderRegistry, Resource, ResourceKind, RiskLevel,
+    RiskSummary, ScanOptions, Session, SessionLifecycle,
 };
 use agenttidy_infrastructure::{
     audit_log,
     fs_probe::{walk_tree, EntryKind},
-    trash::{self, TrashError, TrashOutcome},
+    operation_guard,
+    trash::{self, PathTrashResult, TrashError, TrashOutcome},
 };
 use agenttidy_provider_api::{AgentProviderAdapter, ProviderInspection};
 use agenttidy_workbuddy::WorkBuddyAdapter;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static CLEANUP_PLAN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// §11.1 "archived + inactive > 30d" window for the single LowRisk path.
+const THIRTY_DAYS_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Pure inputs the policy reads. `now_ms` is injected so the policy
 /// stays deterministic (testable without a system clock).
@@ -294,7 +299,138 @@ impl Application {
             decision.reasons.push("no Error-level scan problems".into());
         }
 
-        if decision.blockers.is_empty() {
+        // Session linkage (§9.3 + §11): every risk rule is lifecycle-
+        // based, so a unit must resolve to its owning session through the
+        // scan snapshot. No linkage ⇒ fail closed (red line #6: "never act
+        // on what we do not understand").
+        let linked_resources: Vec<&Resource> = unit
+            .resources
+            .iter()
+            .filter_map(|reference| {
+                ctx.snapshot
+                    .resources
+                    .iter()
+                    .find(|resource| resource.id == reference.id)
+            })
+            .collect();
+        // §11.1 LowRisk needs *every* condition to hold; any unmet one
+        // below flips this off. Starts pessimistic only when there is no
+        // evidence at all.
+        let mut low_risk_eligible = true;
+        if linked_resources.is_empty() {
+            decision.blockers.push(
+                "unit does not resolve to a resource in the scan snapshot (§11 fail-closed)".into(),
+            );
+            low_risk_eligible = false;
+        }
+        for resource in &linked_resources {
+            // §9.5: only Exclusive resources may form units — anything
+            // else is a contract violation and blocks (red line #6).
+            if resource.ownership != Ownership::Exclusive {
+                decision.blockers.push(format!(
+                    "resource {} is not exclusively owned (§9.5)",
+                    resource.id.as_str()
+                ));
+                low_risk_eligible = false;
+            }
+            if !resource.dependencies.is_empty() {
+                decision.blockers.push(format!(
+                    "resource {} has {} dependency/dependencies (§7.3: shared/unknown deps are Blocked)",
+                    resource.id.as_str(),
+                    resource.dependencies.len()
+                ));
+                low_risk_eligible = false;
+            }
+        }
+        let sessions: Vec<&Session> = linked_resources
+            .iter()
+            .filter_map(|resource| resource.session_id.as_ref())
+            .filter_map(|session_id| {
+                ctx.snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == *session_id)
+            })
+            .collect();
+        if sessions.is_empty() && !linked_resources.is_empty() {
+            decision
+                .blockers
+                .push("unit has no owning session in the scan snapshot (§11 fail-closed)".into());
+            low_risk_eligible = false;
+        }
+
+        // §11.1 archive-aware + §11.2 retention rules (v0.1):
+        // Active/Unknown ⇒ Blocked; Archived + inactive > 30d keeps
+        // LowRisk eligibility; Archived recent / Inactive ⇒ ReviewRequired
+        // — §11.2: age alone never promotes a non-archived session.
+        for session in &sessions {
+            match &session.lifecycle {
+                SessionLifecycle::Active => {
+                    decision
+                        .blockers
+                        .push(format!("session {} is Active (§11.1)", session.id.as_str()));
+                    low_risk_eligible = false;
+                }
+                SessionLifecycle::Unknown => {
+                    decision.blockers.push(format!(
+                        "session {} lifecycle is Unknown (§11.2 fail-closed)",
+                        session.id.as_str()
+                    ));
+                    low_risk_eligible = false;
+                }
+                SessionLifecycle::Inactive => {
+                    decision.reasons.push(format!(
+                        "session {} is Inactive (§11.2: review required — age alone is not Low Risk)",
+                        session.id.as_str()
+                    ));
+                    low_risk_eligible = false;
+                }
+                SessionLifecycle::Archived { archived_at } => {
+                    // Archive is a weighted signal (§3.3), never
+                    // permission on its own (red line #5).
+                    let last_activity = session.updated_at.or(*archived_at).or(session.created_at);
+                    match last_activity {
+                        Some(last) if ctx.now_ms.saturating_sub(last) > THIRTY_DAYS_MS => {
+                            decision.reasons.push(format!(
+                                "session {} is Archived and inactive > 30d (§11.1)",
+                                session.id.as_str()
+                            ));
+                        }
+                        Some(_) => {
+                            low_risk_eligible = false;
+                            decision.reasons.push(format!(
+                                "session {} is Archived but recently active (§11.1 → Review Required)",
+                                session.id.as_str()
+                            ));
+                        }
+                        None => {
+                            low_risk_eligible = false;
+                            decision.reasons.push(format!(
+                                "session {} is Archived with unknown last-activity (§11.1 → Review Required)",
+                                session.id.as_str()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recoverability (§7.1 + §16.4): only Trash actions are
+        // OS-recoverable; a ProviderOperation is never LowRisk in v0.1.
+        if unit.operation.action != CleanupAction::Trash {
+            low_risk_eligible = false;
+        }
+
+        if !decision.blockers.is_empty() {
+            decision.risk = RiskLevel::Blocked;
+        } else if low_risk_eligible {
+            decision.risk = RiskLevel::LowRisk;
+            decision.recommended = true;
+            decision.reasons.push(
+                "all §7.1 conditions hold: archived + inactive > 30d + exclusive + recoverable"
+                    .into(),
+            );
+        } else {
             decision.risk = RiskLevel::ReviewRequired;
             decision.recommended = false;
             decision
@@ -352,6 +488,14 @@ impl Application {
             };
 
             for unit in units {
+                // §16.1 + §12.2 admission: the provider re-validates the
+                // unit's paths against its data roots and declares the
+                // typed preconditions before the unit may enter a plan.
+                // Validation failure fails the whole plan build — no
+                // silent drops (fail-closed).
+                let preconditions = provider
+                    .validate_cleanup_unit(&unit, &snapshot.installation)
+                    .await?;
                 let decision = Self::cleanup_policy_evaluate(&unit, &ctx);
                 total_reclaimable_bytes =
                     total_reclaimable_bytes.saturating_add(unit.estimated_reclaimable_bytes);
@@ -361,10 +505,12 @@ impl Application {
                     installation_id: unit.installation_id.clone(),
                     provider: unit.provider.clone(),
                     fingerprint: unit.fingerprint.clone(),
+                    locator: unit.locator.clone(),
+                    estimated_reclaimable_bytes: unit.estimated_reclaimable_bytes,
                     action: unit.operation.action,
                     risk: decision.risk,
                     reasons: decision.reasons,
-                    preconditions: unit.preconditions.clone(),
+                    preconditions,
                 });
             }
         }
@@ -408,6 +554,21 @@ impl Application {
         &self,
         plan: &CleanupPlan,
     ) -> anyhow::Result<Vec<CleanupRevalidationOutcome>> {
+        // §12.2 TTL: an expired plan is uniformly stale — report it per
+        // item instead of silently re-checking the filesystem.
+        if plan_expired(plan, now_ms()) {
+            return Ok(plan
+                .items
+                .iter()
+                .map(|item| CleanupRevalidationOutcome {
+                    unit_id: item.unit_id.clone(),
+                    outcome: CleanupOutcome::Skipped,
+                    failed_precondition: None,
+                    reason: Some("plan expired (TTL) — rescan and rebuild the plan (§12.2)".into()),
+                })
+                .collect());
+        }
+
         // Build the latest inspection set per installation.
         let mut inspection_by_installation: BTreeMap<String, ProviderInspection> = BTreeMap::new();
         for installation in self.detect().await? {
@@ -448,7 +609,22 @@ impl Application {
             );
         }
 
+        // §12.2 TTL (fail-closed): a stale plan is refused outright —
+        // never silently executed from outdated facts. Enforced here, not
+        // only in the GUI, so raw IPC callers cannot bypass it.
+        if plan_expired(plan, now_ms()) {
+            anyhow::bail!(
+                "plan expired (TTL) — rescan and rebuild the plan before executing (§12.2)"
+            );
+        }
+
         let revalidation = self.cleanup_revalidate(plan).await?;
+        // §12.1: hold the cross-process operation guard for the whole
+        // batch so a second GUI window / CLI instance cannot execute the
+        // same plan concurrently (§12.3: a re-run must not look like a
+        // fresh success). Released by RAII after the last audit row.
+        let _guard = operation_guard::OperationGuard::acquire()
+            .map_err(|error| anyhow::anyhow!("cannot acquire cleanup operation guard: {error}"))?;
         let mut results = Vec::new();
         for (item, revalidation) in plan.items.iter().zip(revalidation.iter()) {
             if !selected_unit_ids.contains(&item.unit_id) {
@@ -473,40 +649,23 @@ impl Application {
                 continue;
             }
 
-            let primary_path = item.fingerprint.path.clone();
-            let locator = CleanupLocator::Dir {
-                path: primary_path.clone(),
-            };
+            let locator = item.locator.clone();
             let action = item.action;
 
             // Execute: today only `Trash` is wired. ProviderOperation
-            // returns `Failed` with a clear reason until Phase 7.
+            // returns `Failed` with a clear reason until its own Phase 7
+            // slice (§12.4: DB rows are never a Trash action).
             let (outcome, reclaimed_bytes, reason) = match action {
-                CleanupAction::Trash => match trash::move_to_trash(&primary_path) {
-                    Ok(TrashOutcome::Removed) => {
-                        (CleanupOutcome::Removed, item.fingerprint.size_bytes, None)
-                    }
-                    Ok(TrashOutcome::AlreadyGone) => (
-                        CleanupOutcome::Skipped,
-                        0,
-                        Some("path already gone at execute time (idempotent skip)".into()),
-                    ),
-                    Ok(TrashOutcome::PlatformError(message)) => (
-                        CleanupOutcome::Failed,
-                        0,
-                        Some(format!("trash platform error: {message}")),
-                    ),
-                    Err(TrashError::NotFound(_)) => (
-                        CleanupOutcome::Skipped,
-                        0,
-                        Some("path not found at execute time (stale plan)".into()),
-                    ),
-                    Err(error) => (
-                        CleanupOutcome::Failed,
-                        0,
-                        Some(format!("trash error: {error}")),
-                    ),
-                },
+                CleanupAction::Trash => {
+                    // A FileSet item moves *every* member path as one
+                    // unit (§9.5); per-path results are aggregated into
+                    // one honest item outcome (§12.3).
+                    let paths: Vec<PathBuf> = item.locator.paths().into_iter().cloned().collect();
+                    aggregate_trash_results(
+                        &trash::move_paths_to_trash(&paths),
+                        item.estimated_reclaimable_bytes,
+                    )
+                }
                 CleanupAction::ProviderOperation => (
                     CleanupOutcome::Failed,
                     0,
@@ -552,6 +711,23 @@ impl Application {
     }
 }
 
+/// §12.2 plan TTL: once `expires_at` passes the plan is uniformly stale
+/// and the user must rescan (`None` = never expires).
+fn plan_expired(plan: &CleanupPlan, now_ms: u64) -> bool {
+    plan.expires_at
+        .is_some_and(|expires_at| now_ms > expires_at)
+}
+
+/// Current wall-clock time in epoch ms. Wall-clock (not monotonic) is
+/// correct here: `CleanupPlan.expires_at` is a wall-clock timestamp that
+/// round-trips through the IPC boundary.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Hash the canonical plan tuple so the executor can reject a stale
 /// confirmation. `sha2::Sha256` is the only thing we need from the
 /// `sha2` workspace dep; no native deps, no MSRV gymnastics.
@@ -592,6 +768,58 @@ fn scan_id_for(snapshots: &[AgentSnapshot]) -> String {
     format!("scan-{:x}", digest)
 }
 
+/// Aggregate per-path trash results into one §12.3 item outcome.
+/// Pure, so the partial-failure rules are unit-testable without a real
+/// trash service (which is environment-dependent — see `trash.rs`).
+/// `estimated` is the unit's reclaim estimate, recorded only when at
+/// least one member actually moved; `AlreadyGone` / `NotFound` count as
+/// idempotent no-ops, never as fresh success.
+fn aggregate_trash_results(
+    results: &[PathTrashResult],
+    estimated: u64,
+) -> (CleanupOutcome, u64, Option<String>) {
+    let mut removed = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for (path, result) in results {
+        match result {
+            Ok(TrashOutcome::Removed) => removed += 1,
+            Ok(TrashOutcome::AlreadyGone) | Err(TrashError::NotFound(_)) => {}
+            Ok(TrashOutcome::PlatformError(message)) => {
+                failures.push(format!("{}: {message}", path.display()));
+            }
+            Err(error) => failures.push(format!("{}: {error}", path.display())),
+        }
+    }
+    if !failures.is_empty() {
+        // §12.3: partial movement must be reported honestly — members
+        // that did move are recoverable from the OS trash, the rest were
+        // not touched. `reclaimed_bytes` stays 0: a partial FileSet is
+        // not the measured unit.
+        let partial = if removed > 0 {
+            format!(
+                "{removed}/{} member(s) moved to trash before failure; ",
+                results.len()
+            )
+        } else {
+            String::new()
+        };
+        return (
+            CleanupOutcome::Failed,
+            0,
+            Some(format!("{partial}{}", failures.join("; "))),
+        );
+    }
+    if removed > 0 {
+        (CleanupOutcome::Removed, estimated, None)
+    } else {
+        (
+            CleanupOutcome::Skipped,
+            0,
+            Some("all unit members already gone (idempotent skip, §12.3)".into()),
+        )
+    }
+}
+
 /// Run the §12.2 invalidation checks against one plan item.
 ///
 /// Walks the filesystem for the item's path and compares against its
@@ -615,7 +843,21 @@ fn revalidate_item(
         }
     }
 
-    // 2. Filesystem-level checks: walk_tree the path, compare the root
+    // 2. Unit membership (§9.5 + §12.2 "path changed"): every locator
+    // member must still exist — a `FileSet` whose side directory was
+    // removed out-of-band is no longer the unit that was planned.
+    for path in item.locator.paths() {
+        if path.symlink_metadata().is_err() {
+            return CleanupRevalidationOutcome {
+                unit_id: item.unit_id.clone(),
+                outcome: CleanupOutcome::Skipped,
+                failed_precondition: Some(CleanupPreconditionKind::PathExists),
+                reason: Some(format!("unit member no longer exists: {}", path.display())),
+            };
+        }
+    }
+
+    // 3. Filesystem-level checks: walk_tree the path, compare the root
     // entry against the recorded fingerprint.
     let outcome = walk_tree(&item.fingerprint.path);
     if outcome.problems.iter().any(|p| {
@@ -750,7 +992,7 @@ mod tests {
     use super::*;
     use agenttidy_core::{
         AgentInstallation, ManagedBy, Ownership, Platform, ProjectRef, Resource, ResourceId,
-        ResourceLocator, Session, SessionId, SessionLifecycle, SizeInfo,
+        ResourceLocator, ResourceRef, Session, SessionId, SessionLifecycle, SizeInfo,
     };
     use std::collections::BTreeMap;
 
@@ -877,28 +1119,84 @@ mod tests {
     // -----------------------------------------------------------------
 
     use agenttidy_core::{
-        CleanupOperation, CleanupPrecondition, FileIdentity, ResourceFingerprint,
+        CleanupLocator, CleanupOperation, CleanupPrecondition, FileIdentity, ResourceFingerprint,
     };
 
-    /// A minimal FileTree unit rooted at `path` for policy tests. The
-    /// fingerprint fields are placeholders — the policy never reads them;
-    /// only `revalidate_item` does (tested separately below).
-    fn unit(path: &str, kind: CleanupUnitKind) -> CleanupUnit {
+    /// Snapshot with one session (given lifecycle + last-activity) owning
+    /// one Exclusive `FileSet` session resource — the shape a real
+    /// transcript cleanup unit is built from (§9.5). Policy tests mutate
+    /// the resource / session to violate single §11 conditions.
+    fn cleanup_snapshot(lifecycle: SessionLifecycle, updated_at: Option<u64>) -> AgentSnapshot {
+        let mut snapshot = snapshot_with_workspace(
+            ProviderId::CODEX,
+            "/Users/example/Documents/Codex/task-a",
+            &[],
+            true,
+        );
+        let provider_id = ProviderId::new(ProviderId::CODEX);
+        let session_id = SessionId::new("session-cleanup-0");
+        snapshot.sessions = vec![Session {
+            id: session_id.clone(),
+            provider: provider_id.clone(),
+            installation_id: snapshot.installation.id.clone(),
+            title: None,
+            project: None,
+            created_at: Some(1_600_000_000_000),
+            updated_at,
+            lifecycle,
+            size: SizeInfo::exact(1024),
+            resource_refs: vec![ResourceRef {
+                id: ResourceId::new("codex:session-resource"),
+                kind: ResourceKind::Session,
+            }],
+            metadata: serde_json::Map::new(),
+        }];
+        snapshot.resources = vec![Resource {
+            id: ResourceId::new("codex:session-resource"),
+            provider: provider_id,
+            installation_id: snapshot.installation.id.clone(),
+            kind: ResourceKind::Session,
+            locator: ResourceLocator::FileSet {
+                paths: vec!["/tmp/transcript.jsonl".into()],
+            },
+            ownership: Ownership::Exclusive,
+            managed_by: ManagedBy::Agent,
+            size: SizeInfo::exact(1024),
+            session_id: Some(session_id),
+            project: None,
+            created_at: None,
+            updated_at: None,
+            dependencies: vec![],
+            metadata: serde_json::Map::new(),
+        }];
+        snapshot
+    }
+
+    /// A FileSet unit linked to `snapshot`'s resource. The fingerprint is
+    /// a placeholder — the policy never reads it; only `revalidate_item`
+    /// does (tested separately below).
+    fn unit_for(snapshot: &AgentSnapshot, kind: CleanupUnitKind) -> CleanupUnit {
         CleanupUnit {
-            id: format!("unit:{path}"),
+            id: "unit:policy".into(),
             provider: ProviderId::new(ProviderId::CODEX),
-            installation_id: "codex:default".into(),
+            installation_id: snapshot.installation.id.clone(),
             kind,
-            resources: vec![],
+            resources: vec![ResourceRef {
+                id: ResourceId::new("codex:session-resource"),
+                kind: ResourceKind::Session,
+            }],
             estimated_reclaimable_bytes: 1024,
             fingerprint: ResourceFingerprint {
-                path: path.into(),
+                path: "/tmp/transcript.jsonl".into(),
                 identity: FileIdentity {
                     volume: 1,
                     index: 2,
                 },
                 size_bytes: 1024,
                 mtime_ms: 1_700_000_000_000,
+            },
+            locator: CleanupLocator::FileSet {
+                paths: vec!["/tmp/transcript.jsonl".into()],
             },
             preconditions: vec![CleanupPrecondition {
                 kind: CleanupPreconditionKind::PathExists,
@@ -907,7 +1205,7 @@ mod tests {
             operation: CleanupOperation {
                 action: CleanupAction::Trash,
             },
-            resource_kind: ResourceKind::Workspace,
+            resource_kind: ResourceKind::Session,
         }
     }
 
@@ -923,28 +1221,16 @@ mod tests {
         }
     }
 
-    fn clean_context(_now_ms: u64) -> (AgentSnapshot, ProviderInspection) {
-        let snapshot = snapshot_with_workspace(
-            ProviderId::CODEX,
-            "/Users/example/Documents/Codex/task-a",
-            &["/Users/example/Documents/Codex/task-a"],
-            true,
-        );
-        (snapshot, ProviderInspection::empty_for_testing())
-    }
-
     #[test]
-    fn policy_marks_clean_unit_review_required() {
-        // §7.2 / §11: without per-resource-kind age facts, every
-        // non-blocked unit is ReviewRequired — never auto-promoted to
-        // LowRisk (red line #5: archive/age alone is not permission).
-        let (snapshot, inspection) = clean_context(1_700_000_000_000);
+    fn policy_marks_inactive_session_unit_review_required() {
+        // §11.2 / §7.2: an Inactive, exclusively-owned, trash-recoverable
+        // unit is ReviewRequired — never auto-promoted to LowRisk (red
+        // line #5: age / absence of archive is not permission).
+        let snapshot = cleanup_snapshot(SessionLifecycle::Inactive, Some(1_700_000_000_000));
+        let inspection = ProviderInspection::empty_for_testing();
         let ctx = context(&snapshot, &inspection, 1_700_000_000_000);
         let decision = Application::cleanup_policy_evaluate(
-            &unit(
-                "/Users/example/Documents/Codex/task-a",
-                CleanupUnitKind::FileTree,
-            ),
+            &unit_for(&snapshot, CleanupUnitKind::FileSet),
             &ctx,
         );
         assert_eq!(decision.risk, RiskLevel::ReviewRequired);
@@ -956,11 +1242,14 @@ mod tests {
     fn policy_blocks_when_agent_is_running() {
         // §16.2: an agent process anywhere near the installation means
         // concurrent execution is unsafe — fail closed (red line #6).
-        let (snapshot, mut inspection) = clean_context(1_700_000_000_000);
+        let snapshot = cleanup_snapshot(SessionLifecycle::Inactive, Some(1_700_000_000_000));
+        let mut inspection = ProviderInspection::empty_for_testing();
         inspection.agent_running = true;
         let ctx = context(&snapshot, &inspection, 1_700_000_000_000);
-        let decision =
-            Application::cleanup_policy_evaluate(&unit("/x", CleanupUnitKind::FileTree), &ctx);
+        let decision = Application::cleanup_policy_evaluate(
+            &unit_for(&snapshot, CleanupUnitKind::FileSet),
+            &ctx,
+        );
         assert_eq!(decision.risk, RiskLevel::Blocked);
         assert!(!decision.recommended);
         assert!(decision
@@ -973,7 +1262,7 @@ mod tests {
     fn policy_blocks_on_scan_error_problem() {
         // An Error-severity scan problem means part of the scan could
         // not be trusted — no unit from that installation may pass (§16.2).
-        let (mut snapshot, inspection) = clean_context(1_700_000_000_000);
+        let mut snapshot = cleanup_snapshot(SessionLifecycle::Inactive, Some(1_700_000_000_000));
         snapshot.problems.insert(
             "unreadable:/x".into(),
             agenttidy_core::ScanProblem::Error {
@@ -981,14 +1270,152 @@ mod tests {
                 path: Some("/x".into()),
             },
         );
+        let inspection = ProviderInspection::empty_for_testing();
         let ctx = context(&snapshot, &inspection, 1_700_000_000_000);
-        let decision =
-            Application::cleanup_policy_evaluate(&unit("/x", CleanupUnitKind::FileTree), &ctx);
+        let decision = Application::cleanup_policy_evaluate(
+            &unit_for(&snapshot, CleanupUnitKind::FileSet),
+            &ctx,
+        );
         assert_eq!(decision.risk, RiskLevel::Blocked);
         assert!(decision
             .blockers
             .iter()
             .any(|b| b.contains("Error problem")));
+    }
+
+    #[test]
+    fn policy_blocks_active_session_units() {
+        // §11.1: an Active session's resources are never cleanable.
+        let snapshot = cleanup_snapshot(SessionLifecycle::Active, Some(1_700_000_000_000));
+        let inspection = ProviderInspection::empty_for_testing();
+        let ctx = context(&snapshot, &inspection, 1_700_000_000_000);
+        let decision = Application::cleanup_policy_evaluate(
+            &unit_for(&snapshot, CleanupUnitKind::FileSet),
+            &ctx,
+        );
+        assert_eq!(decision.risk, RiskLevel::Blocked);
+        assert!(decision
+            .blockers
+            .iter()
+            .any(|b| b.contains("Active (§11.1)")));
+    }
+
+    #[test]
+    fn policy_blocks_unknown_lifecycle_units() {
+        // §11.2 fail-closed: an Unknown lifecycle is indistinguishable
+        // from Active — Blocked.
+        let snapshot = cleanup_snapshot(SessionLifecycle::Unknown, None);
+        let inspection = ProviderInspection::empty_for_testing();
+        let ctx = context(&snapshot, &inspection, 1_700_000_000_000);
+        let decision = Application::cleanup_policy_evaluate(
+            &unit_for(&snapshot, CleanupUnitKind::FileSet),
+            &ctx,
+        );
+        assert_eq!(decision.risk, RiskLevel::Blocked);
+        assert!(decision.blockers.iter().any(|b| b.contains("Unknown")));
+    }
+
+    #[test]
+    fn policy_blocks_units_without_snapshot_linkage() {
+        // Red line #6 ("never act on what we do not understand"): a unit
+        // that does not resolve to a scanned resource is Blocked.
+        let snapshot = cleanup_snapshot(SessionLifecycle::Inactive, Some(1_700_000_000_000));
+        let mut unit = unit_for(&snapshot, CleanupUnitKind::FileSet);
+        unit.resources.clear();
+        let inspection = ProviderInspection::empty_for_testing();
+        let ctx = context(&snapshot, &inspection, 1_700_000_000_000);
+        let decision = Application::cleanup_policy_evaluate(&unit, &ctx);
+        assert_eq!(decision.risk, RiskLevel::Blocked);
+        assert!(decision
+            .blockers
+            .iter()
+            .any(|b| b.contains("does not resolve to a resource")));
+    }
+
+    #[test]
+    fn policy_blocks_non_exclusive_ownership() {
+        // §9.5: only Exclusive resources may form an executable unit —
+        // shared ownership blocks even an otherwise-stale archive.
+        let archived_at = Some(1_600_000_000_000);
+        let mut snapshot =
+            cleanup_snapshot(SessionLifecycle::Archived { archived_at }, archived_at);
+        snapshot.resources[0].ownership = Ownership::Shared;
+        let inspection = ProviderInspection::empty_for_testing();
+        let ctx = context(&snapshot, &inspection, 1_700_000_000_000);
+        let decision = Application::cleanup_policy_evaluate(
+            &unit_for(&snapshot, CleanupUnitKind::FileSet),
+            &ctx,
+        );
+        assert_eq!(decision.risk, RiskLevel::Blocked);
+        assert!(decision
+            .blockers
+            .iter()
+            .any(|b| b.contains("not exclusively owned")));
+    }
+
+    #[test]
+    fn policy_blocks_units_with_dependencies() {
+        // §7.3: shared / unknown dependencies (e.g. an index DB row) are
+        // Blocked until a coordinated ProviderOperation exists.
+        let archived_at = Some(1_600_000_000_000);
+        let mut snapshot =
+            cleanup_snapshot(SessionLifecycle::Archived { archived_at }, archived_at);
+        snapshot.resources[0].dependencies = vec![ResourceRef {
+            id: ResourceId::new("codex:db-row"),
+            kind: ResourceKind::Database,
+        }];
+        let inspection = ProviderInspection::empty_for_testing();
+        let ctx = context(&snapshot, &inspection, 1_700_000_000_000);
+        let decision = Application::cleanup_policy_evaluate(
+            &unit_for(&snapshot, CleanupUnitKind::FileSet),
+            &ctx,
+        );
+        assert_eq!(decision.risk, RiskLevel::Blocked);
+        assert!(decision.blockers.iter().any(|b| b.contains("dependency")));
+    }
+
+    #[test]
+    fn policy_promotes_archived_stale_to_low_risk() {
+        // §11.1: "Archived + inactive > 30d + exclusive + recoverable →
+        // Low Risk" — the single LowRisk path in v0.1.
+        let archived_at = Some(1_600_000_000_000);
+        let snapshot = cleanup_snapshot(SessionLifecycle::Archived { archived_at }, archived_at);
+        let inspection = ProviderInspection::empty_for_testing();
+        // 30d+ after the last activity.
+        let ctx = context(
+            &snapshot,
+            &inspection,
+            1_600_000_000_000 + THIRTY_DAYS_MS + 1_000,
+        );
+        let decision = Application::cleanup_policy_evaluate(
+            &unit_for(&snapshot, CleanupUnitKind::FileSet),
+            &ctx,
+        );
+        assert_eq!(decision.risk, RiskLevel::LowRisk);
+        assert!(decision.recommended);
+        assert!(decision.blockers.is_empty());
+    }
+
+    #[test]
+    fn policy_keeps_recent_archived_at_review_required() {
+        // §11.1: "Archived + recent → Review Required" — archive alone
+        // is a weighted signal, not permission (§3.3).
+        let now = 1_700_000_000_000u64;
+        let snapshot = cleanup_snapshot(
+            SessionLifecycle::Archived {
+                archived_at: Some(now),
+            },
+            Some(now),
+        );
+        let inspection = ProviderInspection::empty_for_testing();
+        let ctx = context(&snapshot, &inspection, now + 5 * 24 * 60 * 60 * 1000);
+        let decision = Application::cleanup_policy_evaluate(
+            &unit_for(&snapshot, CleanupUnitKind::FileSet),
+            &ctx,
+        );
+        assert_eq!(decision.risk, RiskLevel::ReviewRequired);
+        assert!(!decision.recommended);
+        assert!(decision.blockers.is_empty());
     }
 
     #[tokio::test]
@@ -1024,6 +1451,64 @@ mod tests {
             .await
             .expect_err("mismatched fingerprint must be rejected");
         assert!(error.to_string().contains("fingerprint mismatch"));
+    }
+
+    /// §12.2 TTL: an expired plan is uniformly stale at revalidation and
+    /// refused outright at execute — never silently run. Enforced in the
+    /// backend so raw IPC callers cannot bypass the GUI's expiry gate.
+    #[tokio::test]
+    async fn expired_plan_is_skipped_at_revalidate_and_rejected_at_execute() {
+        let app = Application::new();
+        let item = CleanupItem {
+            unit_id: "unit-expired".into(),
+            installation_id: "claude-code:cli".into(),
+            provider: ProviderId::new(ProviderId::CLAUDE_CODE),
+            fingerprint: ResourceFingerprint {
+                path: "/tmp/never-touched.jsonl".into(),
+                identity: FileIdentity {
+                    volume: 1,
+                    index: 2,
+                },
+                size_bytes: 1,
+                mtime_ms: 0,
+            },
+            locator: CleanupLocator::File {
+                path: "/tmp/never-touched.jsonl".into(),
+            },
+            estimated_reclaimable_bytes: 1,
+            action: CleanupAction::Trash,
+            risk: RiskLevel::ReviewRequired,
+            reasons: vec![],
+            preconditions: vec![],
+        };
+        let plan = CleanupPlan {
+            id: "plan-expired".into(),
+            scan_id: "scan-expired".into(),
+            created_at: 0,
+            expires_at: Some(1), // long past — expired
+            items: vec![item.clone()],
+            total_reclaimable_bytes: 1,
+            risk_summary: RiskSummary::default(),
+            fingerprint: "fingerprint-expired".into(),
+        };
+
+        let outcomes = app
+            .cleanup_revalidate(&plan)
+            .await
+            .expect("revalidate succeeds");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].outcome, CleanupOutcome::Skipped);
+        assert!(outcomes[0].reason.as_deref().unwrap().contains("expired"));
+
+        let error = app
+            .cleanup_execute(
+                &plan,
+                &plan.fingerprint,
+                std::slice::from_ref(&item.unit_id),
+            )
+            .await
+            .expect_err("expired plan must be refused at execute");
+        assert!(error.to_string().contains("expired"));
     }
 
     #[tokio::test]
@@ -1071,6 +1556,8 @@ mod tests {
                 size_bytes: 999_999, // deliberately wrong: file is 8 bytes
                 mtime_ms,
             },
+            locator: CleanupLocator::File { path: file.clone() },
+            estimated_reclaimable_bytes: 8,
             action: CleanupAction::Trash,
             risk: RiskLevel::ReviewRequired,
             reasons: vec![],
@@ -1104,7 +1591,7 @@ mod tests {
             installation_id: "codex:default".into(),
             provider: ProviderId::new(ProviderId::CODEX),
             fingerprint: ResourceFingerprint {
-                path: missing,
+                path: missing.clone(),
                 identity: FileIdentity {
                     volume: 1,
                     index: 2,
@@ -1112,6 +1599,8 @@ mod tests {
                 size_bytes: 10,
                 mtime_ms: 0,
             },
+            locator: CleanupLocator::File { path: missing },
+            estimated_reclaimable_bytes: 10,
             action: CleanupAction::Trash,
             risk: RiskLevel::ReviewRequired,
             reasons: vec![],
@@ -1151,6 +1640,8 @@ mod tests {
                 size_bytes: 999, // also wrong, but agent_running wins
                 mtime_ms: 0,
             },
+            locator: CleanupLocator::File { path: file.clone() },
+            estimated_reclaimable_bytes: 4,
             action: CleanupAction::Trash,
             risk: RiskLevel::ReviewRequired,
             reasons: vec![],
@@ -1204,6 +1695,8 @@ mod tests {
                 size_bytes: 8,
                 mtime_ms,
             },
+            locator: CleanupLocator::File { path: file.clone() },
+            estimated_reclaimable_bytes: 8,
             action: CleanupAction::Trash,
             risk: RiskLevel::ReviewRequired,
             reasons: vec![],
@@ -1214,5 +1707,243 @@ mod tests {
         assert_eq!(outcome.outcome, CleanupOutcome::Pending);
         assert_eq!(outcome.failed_precondition, None);
         std::fs::remove_file(&file).ok();
+    }
+
+    /// §9.5 atomicity at revalidation: a FileSet whose side directory is
+    /// gone out-of-band is no longer the planned unit — Skipped with
+    /// PathExists before any fingerprint check runs.
+    #[test]
+    fn revalidate_skips_when_secondary_member_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenttidy-fileset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("t.jsonl");
+        std::fs::write(&transcript, b"x").unwrap();
+        let metadata = std::fs::symlink_metadata(&transcript).unwrap();
+        let mtime_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let real_identity =
+            agenttidy_infrastructure::fs_probe::file_identity(&transcript).expect("identity");
+        let gone_side_dir = dir.join("t"); // deliberately never created
+        let item = CleanupItem {
+            unit_id: "unit-fileset-member".into(),
+            installation_id: "claude-code:cli".into(),
+            provider: ProviderId::new(ProviderId::CLAUDE_CODE),
+            fingerprint: ResourceFingerprint {
+                path: transcript.clone(),
+                identity: FileIdentity {
+                    volume: real_identity.volume,
+                    index: real_identity.index,
+                },
+                size_bytes: 1,
+                mtime_ms,
+            },
+            locator: CleanupLocator::FileSet {
+                paths: vec![transcript, gone_side_dir],
+            },
+            estimated_reclaimable_bytes: 1,
+            action: CleanupAction::Trash,
+            risk: RiskLevel::ReviewRequired,
+            reasons: vec![],
+            preconditions: vec![],
+        };
+        let outcome = revalidate_item(&item, None);
+        assert_eq!(outcome.outcome, CleanupOutcome::Skipped);
+        assert_eq!(
+            outcome.failed_precondition,
+            Some(CleanupPreconditionKind::PathExists)
+        );
+        assert!(outcome
+            .reason
+            .unwrap()
+            .contains("unit member no longer exists"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // §12.3 partial-failure aggregation rules (pure, no trash service).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn aggregate_all_removed_reports_estimate() {
+        let results: Vec<PathTrashResult> = vec![
+            (PathBuf::from("/a"), Ok(TrashOutcome::Removed)),
+            (PathBuf::from("/b"), Ok(TrashOutcome::Removed)),
+        ];
+        let (outcome, reclaimed, reason) = aggregate_trash_results(&results, 4096);
+        assert_eq!(outcome, CleanupOutcome::Removed);
+        assert_eq!(reclaimed, 4096);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn aggregate_all_gone_is_idempotent_skip() {
+        // §12.3: "already moved must not be reported as a fresh success".
+        let results: Vec<PathTrashResult> = vec![
+            (PathBuf::from("/a"), Ok(TrashOutcome::AlreadyGone)),
+            (
+                PathBuf::from("/b"),
+                Err(TrashError::NotFound(PathBuf::from("/b"))),
+            ),
+        ];
+        let (outcome, reclaimed, reason) = aggregate_trash_results(&results, 4096);
+        assert_eq!(outcome, CleanupOutcome::Skipped);
+        assert_eq!(reclaimed, 0);
+        assert!(reason.unwrap().contains("already gone"));
+    }
+
+    #[test]
+    fn aggregate_partial_failure_is_reported_honestly() {
+        // §12.3: partial movement is reported with both the moved count
+        // and the verbatim failure — never as success or silent loss.
+        let results: Vec<PathTrashResult> = vec![
+            (PathBuf::from("/a"), Ok(TrashOutcome::Removed)),
+            (
+                PathBuf::from("/b"),
+                Ok(TrashOutcome::PlatformError("locked".into())),
+            ),
+        ];
+        let (outcome, reclaimed, reason) = aggregate_trash_results(&results, 4096);
+        assert_eq!(outcome, CleanupOutcome::Failed);
+        assert_eq!(reclaimed, 0);
+        let reason = reason.unwrap();
+        assert!(reason.contains("1/2 member(s) moved to trash before failure"));
+        assert!(reason.contains("/b: locked"));
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end execute (§12.1 guard → §12.3 outcomes → §16.3 audit).
+    // -----------------------------------------------------------------
+
+    /// Executes one FileSet item end-to-end with HOME/USERPROFILE
+    /// redirected into the temp dir so the §12.1 guard lock and §16.3
+    /// audit log never touch the real user profile (same isolation
+    /// pattern as the audit-log tests). The native trash is
+    /// environment-dependent (headless macOS has no Finder service), so
+    /// the outcome assertion accepts Removed or Failed — the audit row
+    /// must exist either way.
+    #[tokio::test]
+    async fn execute_trashes_fileset_item_and_writes_audit_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenttidy-execute-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("t.jsonl");
+        let side_dir = dir.join("t");
+        std::fs::write(&transcript, b"body").unwrap();
+        std::fs::create_dir(&side_dir).unwrap();
+        let metadata = std::fs::symlink_metadata(&transcript).unwrap();
+        let mtime_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let real_identity =
+            agenttidy_infrastructure::fs_probe::file_identity(&transcript).expect("identity");
+
+        // Isolate the per-user state dir (guard lock + audit log).
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let previous_home = std::env::var_os("HOME");
+        let previous_user_profile = std::env::var_os("USERPROFILE");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+
+        let item = CleanupItem {
+            unit_id: "unit-e2e".into(),
+            installation_id: "claude-code:cli".into(),
+            provider: ProviderId::new(ProviderId::CLAUDE_CODE),
+            fingerprint: ResourceFingerprint {
+                path: transcript.clone(),
+                identity: FileIdentity {
+                    volume: real_identity.volume,
+                    index: real_identity.index,
+                },
+                size_bytes: 4,
+                mtime_ms,
+            },
+            locator: CleanupLocator::FileSet {
+                paths: vec![transcript.clone(), side_dir.clone()],
+            },
+            estimated_reclaimable_bytes: 4,
+            action: CleanupAction::Trash,
+            risk: RiskLevel::ReviewRequired,
+            reasons: vec![],
+            preconditions: vec![],
+        };
+        let plan = CleanupPlan {
+            id: "plan-e2e".into(),
+            scan_id: "scan-e2e".into(),
+            created_at: 0,
+            expires_at: None,
+            items: vec![item.clone()],
+            total_reclaimable_bytes: 4,
+            risk_summary: RiskSummary::default(),
+            fingerprint: "fingerprint-e2e".into(),
+        };
+
+        let app = Application::new();
+        let results = app
+            .cleanup_execute(
+                &plan,
+                &plan.fingerprint,
+                std::slice::from_ref(&item.unit_id),
+            )
+            .await
+            .expect("execute succeeds");
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                results[0].outcome,
+                CleanupOutcome::Removed | CleanupOutcome::Failed
+            ),
+            "unexpected outcome: {:?}",
+            results[0]
+        );
+
+        // §16.3: one audit row per item regardless of trash availability.
+        let audit_path = agenttidy_infrastructure::audit_log::audit_log_path().expect("audit path");
+        let events =
+            agenttidy_infrastructure::audit_log::read_all(&audit_path).expect("audit rows");
+        assert!(events.iter().any(|event| event.unit_id == "unit-e2e"));
+
+        // §12.3 idempotency: a re-run never reports a fresh success —
+        // the members are gone, so revalidation skips with PathExists.
+        let rerun = app
+            .cleanup_execute(
+                &plan,
+                &plan.fingerprint,
+                std::slice::from_ref(&item.unit_id),
+            )
+            .await
+            .expect("re-run succeeds");
+        assert_eq!(rerun[0].outcome, CleanupOutcome::Skipped);
+
+        // Restore the real home and clean up whatever the trash missed.
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match previous_user_profile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

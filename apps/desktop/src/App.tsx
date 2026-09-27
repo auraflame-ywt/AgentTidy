@@ -90,7 +90,7 @@ function AppShell() {
   const selectedBytes =
     cleanup.plan
       ?.items.filter((item) => cleanup.selectedIds.has(item.unit_id))
-      .reduce((sum, item) => sum + item.fingerprint.size_bytes, 0) ?? 0;
+      .reduce((sum, item) => sum + item.estimated_reclaimable_bytes, 0) ?? 0;
 
   return (
     <div className="min-h-screen bg-neutral-50 text-neutral-900">

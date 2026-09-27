@@ -15,11 +15,13 @@
 //! - §13.1 read-only SQLite — [`sqlite`]
 //! - §16.2 process signal — [`processes`]
 //! - §3.4 trash-first disposal — [`trash`]
+//! - §12.1 operation guard — [`operation_guard`]
 
 pub mod audit_log;
 pub mod disk_usage;
 pub mod fs_probe;
 pub mod jsonl;
+pub mod operation_guard;
 pub mod paths;
 pub mod processes;
 pub mod sqlite;

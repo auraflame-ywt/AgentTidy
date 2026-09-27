@@ -8,9 +8,11 @@
 //! Phase 1 status: the trait shape and inspection types are defined;
 //! adapter implementations land in Phase 3 (`providers/` crates) on top of
 //! infrastructure services (Phase 2). Cleanup-unit methods
-//! (`build_cleanup_units` / `validate_cleanup_unit`, §10) are deferred to
-//! Phase 6 — they are intentionally absent so the v0.1 read-only API
-//! surface cannot grow execution semantics prematurely.
+//! (`build_cleanup_units` / `validate_cleanup_unit`, §10) landed in
+//! Phase 6 and are enabled per resource type in Phase 7 — they are
+//! intentionally absent from providers that have not passed their
+//! safety gate so the v0.1 read-only API surface cannot grow execution
+//! semantics prematurely.
 
 use agenttidy_core::snapshot::ScanProblem;
 use agenttidy_core::{
@@ -65,11 +67,11 @@ pub struct ProviderInspection {
 /// across threads (Tauri commands run on a multithreaded runtime).
 ///
 /// Phase 6 added two `cleanup_*` methods. Default impls return an empty
-/// vec — providers that opt into cleanup (Phase 7's first provider
-/// beta, per `Start.md` §19) override them. The application policy
-/// derives risk on the units the provider emits; cleanup-unit method
-/// bodies must stay provider-neutral (no per-provider risk logic, no
-/// side effects, no in-place mutation of agent state — red line #3).
+/// vec — providers that opt into cleanup (per resource type, behind a
+/// `docs/safety/` doc per `Start.md` §19) override them. The application
+/// policy derives risk on the units the provider emits; cleanup-unit
+/// method bodies must stay provider-neutral (no per-provider risk logic,
+/// no side effects, no in-place mutation of agent state — red line #3).
 #[async_trait::async_trait]
 pub trait AgentProviderAdapter: Send + Sync {
     /// Which agent product this adapter implements.
@@ -112,30 +114,40 @@ pub trait AgentProviderAdapter: Send + Sync {
 
     /// Construct atomic cleanup units from a scan snapshot
     /// (`Start.md` §9.5 + §11). The default returns empty so providers
-    /// that have not opted into cleanup keep their old surface; Phase 7
-    /// enables the first provider's override. Only `Exclusive` resources
-    /// can form a unit — Shared/Unknown inputs must be filtered here,
-    /// not at policy time.
+    /// that have not opted into cleanup keep their old surface. Only
+    /// `Exclusive` resources can form a unit — Shared/Unknown inputs
+    /// must be filtered here, not at policy time. Units are *structural*
+    /// facts (paths, fingerprints, preconditions); whether a unit should
+    /// be cleaned is always the policy's call.
     async fn build_cleanup_units(
         &self,
         snapshot: &AgentSnapshot,
     ) -> anyhow::Result<Vec<CleanupUnit>> {
-        // Phase 6 default: no provider is cleanup-enabled yet.
+        // Default: no cleanup-enabled resource types for this provider.
         let _ = snapshot;
         Ok(Vec::new())
     }
 
-    /// Per-unit preconditions the policy / revalidator should check
-    /// before executing (e.g. "no symlink outside root", "writer lock
-    /// absent", "schema unchanged"). Mirrors §12.2 invalidation
-    /// triggers in typed form. Default returns empty; first provider to
-    /// override also wires `build_cleanup_units`.
+    /// Validate a unit this adapter produced and return the typed
+    /// preconditions the policy / revalidator must check before
+    /// executing (e.g. "no symlink outside root", "schema unchanged").
+    /// Mirrors §12.2 invalidation triggers in typed form.
+    ///
+    /// Called by the Application layer at plan-build time; `Err` drops
+    /// the unit's plan (fail-closed). Implementations must enforce
+    /// §16.1 path safety here: canonicalized containment within the
+    /// installation's `data_roots`, no empty / root / home / over-broad
+    /// paths, no reserved components. The installation is passed
+    /// precisely so the data root is known — validating without it
+    /// cannot prove containment. Default returns empty (no provider-
+    /// specific preconditions).
     async fn validate_cleanup_unit(
         &self,
         unit: &CleanupUnit,
+        installation: &AgentInstallation,
     ) -> anyhow::Result<Vec<CleanupPrecondition>> {
-        // Phase 6 default: no provider-specific preconditions.
-        let _ = unit;
+        // Default: no cleanup-enabled resource types for this provider.
+        let _ = (unit, installation);
         Ok(Vec::new())
     }
 }

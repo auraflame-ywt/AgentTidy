@@ -64,6 +64,26 @@ pub fn move_to_trash(path: &Path) -> Result<TrashOutcome, TrashError> {
     }
 }
 
+/// Per-path result entry of [`move_paths_to_trash`]: which path, and
+/// its own `move_to_trash` outcome (error or not).
+pub type PathTrashResult = (PathBuf, Result<TrashOutcome, TrashError>);
+
+/// Move every path to the OS trash as one logical batch (a `FileSet`
+/// cleanup unit: transcript + side directory, `Start.md` §9.5).
+///
+/// Continues past failures on purpose (§12.3 "partial failure must not
+/// corrupt the report"): stopping at the first error would leave the
+/// caller unable to say *which* members moved. The executor aggregates
+/// the per-path results into one item outcome — the move itself is not
+/// atomic across paths, but everything that did move is recoverable
+/// from the OS trash (`docs/safety/session-transcript-fileset.md`).
+pub fn move_paths_to_trash(paths: &[PathBuf]) -> Vec<PathTrashResult> {
+    paths
+        .iter()
+        .map(|path| (path.clone(), move_to_trash(path)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +133,35 @@ mod tests {
             move_to_trash(&missing),
             Err(TrashError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn move_paths_to_trash_reports_per_path_and_continues_past_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenttidy-trash-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("member-a.txt");
+        std::fs::write(&present, b"temporary").unwrap();
+        let missing = dir.join("member-b.txt");
+
+        // Order is preserved and a missing member must not abort the
+        // batch: the caller needs one row per member path (§12.3).
+        let results = move_paths_to_trash(&[present.clone(), missing.clone()]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, present);
+        assert_eq!(results[1].0, missing);
+        assert!(matches!(results[1].1, Err(TrashError::NotFound(_))));
+        match &results[0].1 {
+            Ok(TrashOutcome::Removed) | Ok(TrashOutcome::PlatformError(_)) => {}
+            other => panic!("existing member must yield a trash attempt: {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

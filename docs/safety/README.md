@@ -12,5 +12,5 @@ its cleanup is enabled. Current status:
 | Resource type | Status |
 | --- | --- |
 | Default workspaces (`file-tree`) | Documented; **not enabled** (Phase 6 framework only, enablement deferred — see the doc's status note). |
-| Session transcripts (`file-set`) | Not documented, not enabled (Phase 7 candidate). |
+| Session transcripts (`file-set`) | Documented in [`session-transcript-fileset.md`](./session-transcript-fileset.md); **enabled (Phase 7 beta)** for the Claude Code provider only. |
 | Provider DB records (`provider-operation`) | Not documented, not enabled (Phase 7 candidate). |

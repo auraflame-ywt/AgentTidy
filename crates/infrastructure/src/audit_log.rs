@@ -22,7 +22,10 @@ use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-const AUDIT_LOG_DIR: &str = ".agenttidy";
+/// Shared per-user state directory (`.agenttidy`), also home to the
+/// §12.1 operation lock — `pub(crate)` so both file-adjacent concerns
+/// agree on one location without a second source of truth.
+pub(crate) const AUDIT_LOG_DIR: &str = ".agenttidy";
 const AUDIT_LOG_FILE: &str = "operations.jsonl";
 
 /// Audit log open / write errors. The executor maps these to

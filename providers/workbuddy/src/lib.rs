@@ -469,8 +469,9 @@ impl AgentProviderAdapter for WorkBuddyAdapter {
     async fn validate_cleanup_unit(
         &self,
         unit: &CleanupUnit,
+        installation: &AgentInstallation,
     ) -> anyhow::Result<Vec<CleanupPrecondition>> {
-        let _ = unit;
+        let _ = (unit, installation);
         Ok(Vec::new())
     }
 }

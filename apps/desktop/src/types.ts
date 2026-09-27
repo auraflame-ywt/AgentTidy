@@ -267,12 +267,27 @@ export interface CleanupPrecondition {
   description: string;
 }
 
+/**
+ * `crates/core/src/cleanup.rs` `CleanupLocator` — serde-tagged on `kind`,
+ * kebab-case. `file-set` carries *all* member paths (§9.5 atomicity):
+ * e.g. a Claude Code transcript plus its same-named side directory.
+ */
+export type CleanupLocator =
+  | { kind: "file"; path: string }
+  | { kind: "dir"; path: string }
+  | { kind: "file-set"; paths: string[] }
+  | { kind: "db-row"; database: string; record_id: string };
+
 /** `crates/core/src/cleanup.rs` `CleanupItem` — one plan row. */
 export interface CleanupItem {
   unit_id: string;
   installation_id: string;
   provider: ProviderId;
   fingerprint: ResourceFingerprint;
+  /** Denormalized from the unit — the executor moves every member path. */
+  locator: CleanupLocator;
+  /** Denormalized reclaim estimate (§16.3 `reclaimed_bytes` on success). */
+  estimated_reclaimable_bytes: number;
   action: CleanupAction;
   risk: RiskLevel;
   reasons: string[];
