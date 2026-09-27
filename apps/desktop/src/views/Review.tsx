@@ -113,9 +113,11 @@ export default function Review({
   }
 
   const items = plan?.items ?? [];
+  // Byte totals use the unit estimate (whole FileSet), not the primary
+  // member's fingerprint size — matches plan.total_reclaimable_bytes.
   const selectedBytes = items
     .filter((item) => selectedIds.has(item.unit_id))
-    .reduce((sum, item) => sum + item.fingerprint.size_bytes, 0);
+    .reduce((sum, item) => sum + item.estimated_reclaimable_bytes, 0);
   const staleIds = new Set(
     revalidation
       .filter((entry) => entry.outcome !== "pending")
@@ -131,7 +133,16 @@ export default function Review({
     groups.get(key)!.push(item);
   }
 
+  // §12.2 plan TTL: checked at render *and* at click time — a plan that
+  // expires while the view is open must never silently execute.
+  const isExpired = (): boolean => {
+    const expiresAt = plan?.expires_at;
+    return expiresAt != null && Date.now() > expiresAt;
+  };
+  const expired = isExpired();
+
   const canExecute =
+    !expired &&
     selectedIds.size > 0 &&
     revalidated &&
     [...selectedIds].every((id) => !staleIds.has(id));
@@ -177,7 +188,11 @@ export default function Review({
             {revalidated ? (
               <button
                 type="button"
-                onClick={onOpenConfirm}
+                onClick={() => {
+                  // Live TTL re-check: expiry may pass between render and
+                  // click (§12.2 — never silently execute a stale plan).
+                  if (!isExpired()) onOpenConfirm();
+                }}
                 disabled={!canExecute}
                 className="rounded-md bg-emerald-600 px-5 py-2 text-sm font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
               >
@@ -186,8 +201,10 @@ export default function Review({
             ) : (
               <button
                 type="button"
-                onClick={onRevalidate}
-                disabled={selectedIds.size === 0}
+                onClick={() => {
+                  if (!isExpired()) onRevalidate();
+                }}
+                disabled={selectedIds.size === 0 || expired}
                 className="rounded-md bg-emerald-600 px-5 py-2 text-sm font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {t("review.reviewSelected")}
@@ -202,6 +219,13 @@ export default function Review({
             {t("review.phase7.before")}
             <code className="font-mono text-xs">docs/safety/</code>
             {t("review.phase7.after")}
+          </div>
+        ) : null}
+
+        {/* §12.2 TTL gate — "plan expired, rescan" instead of a silent run. */}
+        {expired ? (
+          <div className="mt-4 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            {t("review.expired")}
           </div>
         ) : null}
 
@@ -302,7 +326,7 @@ export default function Review({
                   <input
                     type="checkbox"
                     checked={selectedIds.has(item.unit_id)}
-                    disabled={blocked}
+                    disabled={blocked || stale}
                     onChange={() => onToggle(item.unit_id)}
                     className="h-4 w-4 rounded border-neutral-300 disabled:cursor-not-allowed disabled:opacity-40"
                     aria-label={t("review.ariaSelect", { id: item.unit_id })}
@@ -314,9 +338,49 @@ export default function Review({
                     <div className="truncate text-xs text-neutral-500">
                       {primaryReason}
                     </div>
+                    {/* §6.3 per-item facts: operation mode + recoverability,
+                        plus the contained resources for FileSet units. */}
+                    <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-neutral-500">
+                      <span className="rounded bg-neutral-100 px-1.5 py-0.5">
+                        {t(
+                          item.action === "trash"
+                            ? "review.item.action.trash"
+                            : "review.item.action.providerOperation",
+                        )}
+                      </span>
+                      <span className="rounded bg-neutral-100 px-1.5 py-0.5">
+                        {t(
+                          item.action === "trash"
+                            ? "review.item.recoverable.trash"
+                            : "review.item.recoverable.providerOperation",
+                        )}
+                      </span>
+                      {item.locator.kind === "file-set" ? (
+                        <details>
+                          <summary className="cursor-pointer select-none">
+                            {t(
+                              item.locator.paths.length === 1
+                                ? "review.item.members.one"
+                                : "review.item.members.other",
+                              { count: item.locator.paths.length },
+                            )}
+                          </summary>
+                          <ul className="mt-1 space-y-0.5">
+                            {item.locator.paths.map((member) => (
+                              <li
+                                key={member}
+                                className="truncate font-mono text-[11px] text-neutral-400"
+                              >
+                                {member}
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+                      ) : null}
+                    </div>
                   </div>
                   <span className="text-xs tabular-nums text-neutral-700">
-                    {humanBytes(item.fingerprint.size_bytes)}
+                    {humanBytes(item.estimated_reclaimable_bytes)}
                   </span>
                   <span
                     className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${badge.className}`}

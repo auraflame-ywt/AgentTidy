@@ -127,7 +127,7 @@ export const zh: Record<TranslationKey, string> = {
   "review.cleanNow": "立即清理",
   "review.reviewSelected": "审查所选",
   "review.phase7.before":
-    "本机暂无清理单元。Provider 清理是 Phase 7 交付内容（Start.md §19）——框架、IPC 契约、审计日志、两步确认流程与本 Review 界面已先行落地以支撑启用。每种资源类型在启用清理前都会获得自己的 ",
+    "最近一次扫描没有发现清理单元。Provider 清理按资源类型逐步启用（Start.md §19）——Claude Code 会话清理 Beta 已开放；其他资源类型通过各自安全门槛后陆续启用。每种资源类型在启用清理前都会获得自己的 ",
   "review.phase7.after": " 文档。",
   "review.bucket.recommended": "{count} 项建议清理",
   "review.bucket.caution": "{count} 项谨慎清理",
@@ -144,6 +144,14 @@ export const zh: Record<TranslationKey, string> = {
   "review.revalidateChanged.other":
     "{count} 个单元自计划生成以来发生变化，已从选择中移除（§12.2）。请返回并刷新以重新生成计划。",
   "review.ariaSelect": "选择 {id}",
+  "review.expired":
+    "计划已过期——请重新扫描（返回 → 刷新）后再审查或清理（§12.2）。",
+  "review.item.action.trash": "移入回收站",
+  "review.item.action.providerOperation": "Agent 专属操作",
+  "review.item.recoverable.trash": "可从系统回收站恢复",
+  "review.item.recoverable.providerOperation": "不可通过回收站恢复",
+  "review.item.members.one": "单元包含 1 个路径",
+  "review.item.members.other": "单元包含 {count} 个路径",
 
   // --- ReviewConfirm modal ---
   "confirm.title": "确认清理",

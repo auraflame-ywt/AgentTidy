@@ -140,7 +140,7 @@ export const en = {
   "review.cleanNow": "Clean Now",
   "review.reviewSelected": "Review Selected",
   "review.phase7.before":
-    "No cleanup units on this machine yet. Provider cleanup is a Phase 7 deliverable (Start.md §19) — the framework, IPC contract, audit log, two-confirmation flow, and this Review UI are landed now to support the rollout. Every resource type gets its own ",
+    "No cleanup units in the latest scan. Provider cleanup rolls out per resource type (Start.md §19) — the Claude Code transcript cleanup beta is live; other resource types land as each passes its safety gate. Every resource type gets its own ",
   "review.phase7.after":
     " document before its cleanup is enabled.",
   "review.bucket.recommended": "{count} recommended",
@@ -159,6 +159,14 @@ export const en = {
   "review.revalidateChanged.other":
     "{count} units changed since the plan was built and were removed from selection (§12.2). Re-run Back → Refresh to rebuild.",
   "review.ariaSelect": "select {id}",
+  "review.expired":
+    "Plan expired — please rescan (Back → Refresh) before reviewing or cleaning (§12.2).",
+  "review.item.action.trash": "Move to Trash",
+  "review.item.action.providerOperation": "Provider operation",
+  "review.item.recoverable.trash": "Recoverable from the system Trash",
+  "review.item.recoverable.providerOperation": "Not trash-recoverable",
+  "review.item.members.one": "1 path in this unit",
+  "review.item.members.other": "{count} paths in this unit",
 
   // --- ReviewConfirm modal ---
   "confirm.title": "Confirm cleanup",

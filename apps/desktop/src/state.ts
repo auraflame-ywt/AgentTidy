@@ -122,15 +122,27 @@ export function useCleanupState(): CleanupState {
     refreshPreview();
   }, [refreshPreview]);
 
-  const toggle = useCallback((unitId: string) => {
-    setRevalidated(false); // selection changed ⇒ re-run step 2
-    setSelectedIds((current) => {
-      const next = new Set(current);
-      if (next.has(unitId)) next.delete(unitId);
-      else next.add(unitId);
-      return next;
-    });
-  }, []);
+  const toggle = useCallback(
+    (unitId: string) => {
+      // §6.3: blocked is *never* selectable and a stale (changed) row
+      // must not re-enter the selection between the two confirmations —
+      // refused at the state layer, not only via the disabled checkbox.
+      const item = plan?.items.find((entry) => entry.unit_id === unitId);
+      if (!item || item.risk === "blocked") return;
+      const stale = revalidation.some(
+        (entry) => entry.unit_id === unitId && entry.outcome !== "pending",
+      );
+      if (stale) return;
+      setRevalidated(false); // selection changed ⇒ re-run step 2
+      setSelectedIds((current) => {
+        const next = new Set(current);
+        if (next.has(unitId)) next.delete(unitId);
+        else next.add(unitId);
+        return next;
+      });
+    },
+    [plan, revalidation],
+  );
 
   const revalidate = useCallback(() => {
     if (!plan) return;
@@ -139,6 +151,20 @@ export function useCleanupState(): CleanupState {
       .then((results) => {
         setRevalidation(results);
         setRevalidated(true);
+        // §12.2: units that changed since the plan drop out of the
+        // selection — this is what the `review.revalidateChanged` copy
+        // promises the user.
+        const staleIds = new Set(
+          results
+            .filter((entry) => entry.outcome !== "pending")
+            .map((entry) => entry.unit_id),
+        );
+        if (staleIds.size > 0) {
+          setSelectedIds(
+            (current) =>
+              new Set([...current].filter((id) => !staleIds.has(id))),
+          );
+        }
       })
       .catch((reason: unknown) => {
         setError(reason instanceof Error ? reason.message : String(reason));
@@ -153,6 +179,11 @@ export function useCleanupState(): CleanupState {
     cleanupExecute(plan, plan.fingerprint, [...selectedIds])
       .then((results) => {
         setOutcomes(results);
+        // Post-execute (§12.3): the plan is spent — clear the selection
+        // and the step-2 flag so the next run requires a fresh scan /
+        // preview instead of silently re-executing the same plan.
+        setSelectedIds(new Set());
+        setRevalidated(false);
       })
       .catch((reason: unknown) => {
         setError(reason instanceof Error ? reason.message : String(reason));
