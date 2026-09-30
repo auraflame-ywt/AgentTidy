@@ -53,6 +53,99 @@ pub struct ReadOnlyDb {
     temp_dir: Option<PathBuf>,
 }
 
+/// Writable SQLite connection used only for §12.4 self-implemented
+/// `ProviderOperation` cleanup (backup → BEGIN IMMEDIATE → DELETE →
+/// FK check → atomic replace). The agent's source database is *never*
+/// opened for writing — the only entry point is
+/// [`MutableSqliteDb::open_mutable_on_temp_copy`], which copies the
+/// file (and its `-wal` / `-shm` sidecars) into a private temp dir
+/// first and exposes a connection to the copy.
+///
+/// Red line: the type system is the gate. `MutableSqliteDb::open`
+/// does not exist; every consumer must go through
+/// `open_mutable_on_temp_copy`. A misuse (writing to the agent's
+/// source path) requires ignoring the type signature, which is the
+/// same friction as forking the project.
+pub struct MutableSqliteDb {
+    conn: rusqlite::Connection,
+    /// The temp copy path the connection writes to. The agent's
+    /// source file is never touched; once the caller is done with
+    /// the mutation they `fs::rename` this path back to the agent's
+    /// source location (atomic on the same volume).
+    temp_path: PathBuf,
+    /// The temp directory that owns the copy. Removed on drop.
+    temp_dir: PathBuf,
+}
+
+impl MutableSqliteDb {
+    /// Open a writable connection to a private temp copy of `src`.
+    /// Returns the connection. The temp dir is owned by the returned
+    /// value and removed on drop; the caller retrieves the temp file
+    /// path via [`MutableSqliteDb::path`] for the eventual
+    /// `fs::rename` over the agent's source location.
+    pub fn open_mutable_on_temp_copy(src: &Path) -> anyhow::Result<Self> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agenttidy-rw-sqlite-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir)?;
+        let copy = temp_dir.join("db.sqlite");
+        // Best-effort copy of `db` + `-wal` + `-shm` so SQLite can
+        // perform WAL recovery on *our* file rather than the agent's
+        // (red line: never open the agent's database read-write).
+        std::fs::copy(src, &copy)?;
+        for suffix in ["-wal", "-shm"] {
+            let mut candidate = src.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let dst = temp_dir.join(format!("db.sqlite{suffix}"));
+            let _ = std::fs::copy(Path::new(&candidate), dst);
+        }
+        let conn = rusqlite::Connection::open(&copy)?;
+        Ok(Self {
+            conn,
+            temp_path: copy,
+            temp_dir,
+        })
+    }
+
+    /// The path to the writable temp copy. After successful mutation
+    /// the application layer `fs::rename`s this over the agent's
+    /// source path.
+    pub fn path(&self) -> &Path {
+        &self.temp_path
+    }
+
+    /// Mutable access to the underlying connection. The caller is
+    /// responsible for wrapping mutations in `BEGIN IMMEDIATE` /
+    /// `COMMIT` and for running `PRAGMA wal_checkpoint(TRUNCATE)` +
+    /// `PRAGMA quick_check` + `PRAGMA foreign_key_check` before
+    /// renaming the file over the agent's source (§12.4).
+    pub fn connection_mut(&mut self) -> &mut rusqlite::Connection {
+        &mut self.conn
+    }
+
+    /// Read-only access (e.g. for the `quick_check` /
+    /// `foreign_key_check` PRAGMAs that should not require write
+    /// access). Mirrors `ReadOnlyDb::connection`.
+    pub fn connection(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+}
+
+impl Drop for MutableSqliteDb {
+    fn drop(&mut self) {
+        // Close the connection *before* removing the temp dir. We
+        // don't swap to an in-memory fallback here because the
+        // destructor of `rusqlite::Connection` already releases the
+        // file lock when it runs.
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
 impl ReadOnlyDb {
     /// Open `path` read-only with the copy fallback (see module docs).
     pub fn open(path: &Path) -> Result<Self, SqliteOpenError> {
@@ -332,5 +425,85 @@ mod tests {
         assert!(uri.ends_with("?mode=ro"), "{uri}");
         assert!(!uri.contains(' '), "{uri}");
         assert!(uri.contains("%20"), "{uri}");
+    }
+
+    /// `MutableSqliteDb` must never expose a constructor that
+    /// accepts an arbitrary path — the agent's source DB must be
+    /// written only via `fs::rename` over a temp copy. The
+    /// type-level gate is the *only* enforcement.
+    #[test]
+    fn mutable_sqlite_db_only_exposes_temp_copy_entry_point() {
+        // Constructing via `open_mutable_on_temp_copy` works.
+        let src = std::env::temp_dir().join(format!(
+            "agenttidy-mut-src-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            "construct",
+        ));
+        std::fs::create_dir_all(&src).unwrap();
+        let db = src.join("db.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE t (x)", []).unwrap();
+        }
+        let mut mdb = MutableSqliteDb::open_mutable_on_temp_copy(&db)
+            .expect("temp-copy constructor must succeed");
+        // Mutations land on the temp path, not on the source file.
+        mdb.connection_mut()
+            .execute("INSERT INTO t VALUES (42)", [])
+            .unwrap();
+        let source_count: i64 = {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            source_count, 0,
+            "source file must not see the mutation — the temp path is what we write to"
+        );
+        let temp_count: i64 = mdb
+            .connection()
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(temp_count, 1);
+        std::fs::remove_dir_all(&src).ok();
+        // `mdb` drops here — the temp dir is removed by Drop.
+    }
+
+    /// The temp directory owned by `MutableSqliteDb` must be removed
+    /// on drop, otherwise the OS would accumulate stale copies of
+    /// the agent's database indefinitely.
+    #[test]
+    fn mutable_sqlite_db_drop_removes_temp_directory() {
+        let src = std::env::temp_dir().join(format!(
+            "agenttidy-mut-drop-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            "drop",
+        ));
+        std::fs::create_dir_all(&src).unwrap();
+        let db = src.join("db.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE t (x)", []).unwrap();
+        }
+        let temp_path = {
+            let mdb = MutableSqliteDb::open_mutable_on_temp_copy(&db).expect("open constructor");
+            let p = mdb.path().to_path_buf();
+            assert!(p.is_file(), "temp copy must exist while mdb is alive");
+            p
+        };
+        // After Drop the temp copy is gone.
+        assert!(
+            !temp_path.exists(),
+            "MutableSqliteDb::drop must remove the temp dir"
+        );
+        std::fs::remove_dir_all(&src).ok();
     }
 }

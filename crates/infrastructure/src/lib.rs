@@ -18,6 +18,7 @@
 //! - §12.1 operation guard — [`operation_guard`]
 
 pub mod audit_log;
+pub mod backup;
 pub mod disk_usage;
 pub mod fs_probe;
 pub mod jsonl;
