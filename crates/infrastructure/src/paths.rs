@@ -224,6 +224,91 @@ fn eq_component(a: &OsStr, b: &OsStr) -> bool {
     a == b
 }
 
+/// §16.1 path safety shared by `file-set` cleanup units across
+/// providers (`docs/safety/session-transcript-fileset.md`,
+/// `docs/safety/workbuddy-session-fileset.md`). Extracted from
+/// `providers/claude-code/src/lib.rs::validate_cleanup_unit` so
+/// every transcript-style unit (Claude Code CLI, Claude Code
+/// Desktop mirrors, WorkBuddy, future siblings) goes through the
+/// same containment and layout checks. Provider-specific rules —
+/// Codex's DB cross-check, WorkBuddy's `sessions.deleted_at`
+/// consistency — still live in the provider's own
+/// `validate_cleanup_unit` after this helper returns `Ok(())`.
+///
+/// The helper rejects:
+///
+/// - empty paths, paths with reserved components (Windows device
+///   names, `\\?\` quirks handled by `has_reserved_component`);
+/// - members that do not share one project directory (the
+///   transcript + sidecars must all sit in `<root>/projects/<slug>/`);
+/// - members that canonicalize outside the installation's data roots
+///   (symlink escapes are never silently followed);
+/// - units whose shared parent is not the `projects` directory
+///   (anything under `blobs/`, `file-history/`, `clipboard-images/`,
+///   `traces/`, `logs/`, `audit-log/`, or a default workspace is not
+///   a verified transcript location and must not be cleaned).
+///
+/// Returns `Ok(())` on success; `Err` with a human-readable reason
+/// otherwise.
+pub fn validate_transcript_fileset_paths(
+    unit: &agenttidy_core::cleanup::CleanupUnit,
+    installation: &agenttidy_core::installation::AgentInstallation,
+) -> anyhow::Result<()> {
+    use agenttidy_core::cleanup::CleanupLocator;
+    let CleanupLocator::FileSet { paths } = &unit.locator else {
+        anyhow::bail!("transcript file sets must use FileSet locators");
+    };
+    let Some(primary) = paths.first() else {
+        anyhow::bail!("empty file set");
+    };
+    let Some(shared_dir) = primary.parent() else {
+        anyhow::bail!(
+            "file set path has no parent directory: {}",
+            primary.display()
+        );
+    };
+    let roots = installation
+        .data_roots
+        .iter()
+        .map(|root| safe_canonicalize(Path::new(root)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            anyhow::bail!("empty path in file set");
+        }
+        if has_reserved_component(path) {
+            anyhow::bail!("reserved path component in file set: {}", path.display());
+        }
+        if path.parent() != Some(shared_dir) {
+            anyhow::bail!(
+                "file set members must share one project directory (transcript + side directory): {}",
+                path.display()
+            );
+        }
+        // Canonicalize first: a member that is a symlink pointing out
+        // of the data root lands outside `roots` and is rejected
+        // (§16.1 "不跟随指向数据根目录之外的 Symlink").
+        let canonical = safe_canonicalize(path)
+            .map_err(|error| anyhow::anyhow!("cannot canonicalize {}: {error}", path.display()))?;
+        if !roots.iter().any(|root| is_within(root, &canonical)) {
+            anyhow::bail!("unit path escapes provider data roots: {}", path.display());
+        }
+    }
+    // Layout invariant: transcripts live at `<root>/projects/<slug>/`
+    // for Claude Code CLI, Claude Code Desktop mirrors, and WorkBuddy
+    // — a shared dir whose parent is not `projects` is not a verified
+    // transcript location and must not be cleaned.
+    let inside_projects = shared_dir.parent().and_then(|parent| parent.file_name())
+        == Some(std::ffi::OsStr::new("projects"));
+    if !inside_projects {
+        anyhow::bail!(
+            "file set is not inside a verified projects/<slug>/ directory: {}",
+            shared_dir.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +500,246 @@ mod tests {
         assert!(safe_canonicalize(&missing).is_err());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `validate_transcript_fileset_paths` accepts a `FileSet` whose
+    /// members all live under `<root>/projects/<slug>/` (the verified
+    /// layout shared by Claude Code CLI, Claude Code Desktop mirrors
+    /// and WorkBuddy). §16.1 path safety.
+    #[test]
+    fn validate_transcript_fileset_paths_accepts_verified_layout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agenttidy-validate-fs-ok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = tmp.join("data");
+        let project = root.join("projects").join("alpha");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("abc.jsonl");
+        let side = project.join("abc");
+        std::fs::write(&transcript, b"").unwrap();
+        std::fs::create_dir(&side).unwrap();
+
+        let unit = make_fileset_unit(&[transcript.clone(), side.clone()]);
+        let installation = make_installation(&[root.to_string_lossy().into_owned()]);
+        validate_transcript_fileset_paths(&unit, &installation)
+            .expect("verified layout must be accepted");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A symlink pointing outside the data root is rejected even
+    /// though it shares the project directory — §16.1 does not
+    /// silently follow symlinks out of the data root.
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_transcript_fileset_paths_rejects_symlink_escape() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agenttidy-validate-fs-sym-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = tmp.join("data");
+        let outside = tmp.join("outside");
+        let project = root.join("projects").join("alpha");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target_outside = outside.join("victim.txt");
+        std::fs::write(&target_outside, b"x").unwrap();
+        let transcript = project.join("abc.jsonl");
+        let escaped = project.join("escape.jsonl");
+        std::fs::write(&transcript, b"").unwrap();
+        std::os::unix::fs::symlink(&target_outside, &escaped).unwrap();
+
+        let unit = make_fileset_unit(&[transcript.clone(), escaped]);
+        let installation = make_installation(&[root.to_string_lossy().into_owned()]);
+        let error = validate_transcript_fileset_paths(&unit, &installation)
+            .expect_err("symlink out of root must be rejected");
+        assert!(
+            error.to_string().contains("escapes"),
+            "unexpected error: {error}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A member that does not share the project directory is
+    /// rejected — the file set is one logical resource, not a
+    /// grab-bag of paths.
+    #[test]
+    fn validate_transcript_fileset_paths_rejects_scattered_members() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agenttidy-validate-fs-scatter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = tmp.join("data");
+        let project_a = root.join("projects").join("alpha");
+        let project_b = root.join("projects").join("beta");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+        let transcript = project_a.join("abc.jsonl");
+        let other = project_b.join("xyz.jsonl");
+        std::fs::write(&transcript, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+
+        let unit = make_fileset_unit(&[transcript.clone(), other]);
+        let installation = make_installation(&[root.to_string_lossy().into_owned()]);
+        let error = validate_transcript_fileset_paths(&unit, &installation)
+            .expect_err("scattered members must be rejected");
+        assert!(
+            error.to_string().contains("share one project directory"),
+            "unexpected error: {error}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A `FileSet` whose shared parent is *not* `projects` (e.g. sits
+    /// in a workspace dir) is rejected — `blobs/`, `file-history/`,
+    /// `clipboard-images/`, `traces/`, `logs/`, `audit-log/` and
+    /// default workspace roots are not verified transcript locations.
+    #[test]
+    fn validate_transcript_fileset_paths_rejects_non_projects_parent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agenttidy-validate-fs-parent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = tmp.join("data");
+        let wrong = root.join("file-history").join("alpha");
+        std::fs::create_dir_all(&wrong).unwrap();
+        let transcript = wrong.join("abc.jsonl");
+        let side = wrong.join("abc");
+        std::fs::write(&transcript, b"").unwrap();
+        std::fs::create_dir(&side).unwrap();
+
+        let unit = make_fileset_unit(&[transcript.clone(), side]);
+        let installation = make_installation(&[root.to_string_lossy().into_owned()]);
+        let error = validate_transcript_fileset_paths(&unit, &installation)
+            .expect_err("non-projects parent must be rejected");
+        assert!(
+            error.to_string().contains("projects/<slug>/"),
+            "unexpected error: {error}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// An empty file set is rejected (`paths.first()` is `None`).
+    #[test]
+    fn validate_transcript_fileset_paths_rejects_empty_set() {
+        let unit = make_fileset_unit(&[]);
+        let installation = make_installation(&[]);
+        let error = validate_transcript_fileset_paths(&unit, &installation)
+            .expect_err("empty file set must be rejected");
+        assert!(
+            error.to_string().contains("empty file set"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A non-FileSet locator is rejected — the helper is specific to
+    /// transcript file sets; workspace trees and DB rows have their
+    /// own validators.
+    #[test]
+    fn validate_transcript_fileset_paths_rejects_non_fileset_locator() {
+        use agenttidy_core::cleanup::{CleanupLocator, ResourceFingerprint};
+        let unit = agenttidy_core::cleanup::CleanupUnit {
+            id: "x".into(),
+            provider: agenttidy_core::provider::ProviderId::new("test"),
+            installation_id: "test".into(),
+            kind: agenttidy_core::cleanup::CleanupUnitKind::ProviderOperation,
+            resources: Vec::new(),
+            estimated_reclaimable_bytes: 0,
+            fingerprint: ResourceFingerprint {
+                path: std::path::PathBuf::from("/tmp"),
+                identity: agenttidy_core::cleanup::FileIdentity {
+                    volume: 0,
+                    index: 0,
+                },
+                size_bytes: 0,
+                mtime_ms: 0,
+            },
+            locator: CleanupLocator::DbRow {
+                database: std::path::PathBuf::from("/tmp/x.sqlite"),
+                record_id: "row-1".into(),
+            },
+            preconditions: Vec::new(),
+            operation: agenttidy_core::cleanup::CleanupOperation {
+                action: agenttidy_core::cleanup::CleanupAction::ProviderOperation,
+            },
+            resource_kind: agenttidy_core::resource::ResourceKind::Session,
+        };
+        let installation = make_installation(&[]);
+        let error = validate_transcript_fileset_paths(&unit, &installation)
+            .expect_err("non-FileSet locator must be rejected");
+        assert!(
+            error.to_string().contains("FileSet"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Build a `CleanupUnit` whose `locator` is a `FileSet` of the given
+    /// paths. Centralizes the boilerplate for the helper tests above.
+    fn make_fileset_unit(paths: &[std::path::PathBuf]) -> agenttidy_core::cleanup::CleanupUnit {
+        use agenttidy_core::cleanup::{
+            CleanupAction, CleanupLocator, CleanupOperation, CleanupUnit, CleanupUnitKind,
+            FileIdentity, ResourceFingerprint,
+        };
+        use agenttidy_core::resource::ResourceKind;
+        let paths: Vec<std::path::PathBuf> = paths.to_vec();
+        let primary = paths.first().cloned().unwrap_or_default();
+        CleanupUnit {
+            id: "test-unit".into(),
+            provider: agenttidy_core::provider::ProviderId::new("test"),
+            installation_id: "test".into(),
+            kind: CleanupUnitKind::FileSet,
+            resources: Vec::new(),
+            estimated_reclaimable_bytes: 0,
+            fingerprint: ResourceFingerprint {
+                path: primary,
+                identity: FileIdentity {
+                    volume: 0,
+                    index: 0,
+                },
+                size_bytes: 0,
+                mtime_ms: 0,
+            },
+            locator: CleanupLocator::FileSet { paths },
+            preconditions: Vec::new(),
+            operation: CleanupOperation {
+                action: CleanupAction::Trash,
+            },
+            resource_kind: ResourceKind::Session,
+        }
+    }
+
+    /// Build an `AgentInstallation` whose `data_roots` are the given raw
+    /// path strings. Used by helper tests that exercise path containment.
+    fn make_installation(data_roots: &[String]) -> agenttidy_core::installation::AgentInstallation {
+        use agenttidy_core::installation::{AgentInstallation, InstallationStatus, Platform};
+        use agenttidy_core::provider::ProviderId;
+        AgentInstallation {
+            id: "test".into(),
+            provider: ProviderId::new("test"),
+            platform: Platform::Macos,
+            version: None,
+            data_roots: data_roots.to_vec(),
+            status: InstallationStatus::Available,
+        }
     }
 }

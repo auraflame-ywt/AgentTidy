@@ -14,6 +14,7 @@
 //! safety gate so the v0.1 read-only API surface cannot grow execution
 //! semantics prematurely.
 
+use agenttidy_core::cleanup::CleanupItemOutcome;
 use agenttidy_core::snapshot::ScanProblem;
 use agenttidy_core::{
     AgentCapabilities, AgentInstallation, AgentSnapshot, CleanupPrecondition, CleanupUnit,
@@ -150,8 +151,43 @@ pub trait AgentProviderAdapter: Send + Sync {
         let _ = (unit, installation);
         Ok(Vec::new())
     }
+
+    /// Execute a single `CleanupAction::ProviderOperation` item that
+    /// this adapter emitted (`docs/safety/provider-operation.md`,
+    /// `Start.md` §12.4). The Application layer routes every
+    /// `ProviderOperation` item to this method once the revalidation
+    /// passes and the cross-process operation guard is held. Each
+    /// provider implements its own coordinated delete — backup →
+    /// transaction → FK check → atomic replace — and reports the
+    /// outcome (including `reclaimed_bytes` for the audit log).
+    ///
+    /// Default returns `Failed` so providers that have not opted into
+    /// `ProviderOperation` keep the legacy "not wired" behaviour
+    /// without breaking dispatch. The item's `record_id` and
+    /// `database` are read from `item.locator` (which the plan-build
+    /// pipeline guarantees is a `CleanupLocator::DbRow` for this
+    /// action).
+    async fn execute_provider_operation(
+        &self,
+        item: &agenttidy_core::cleanup::CleanupItem,
+        installation: &AgentInstallation,
+    ) -> anyhow::Result<CleanupItemOutcome> {
+        let _ = (item, installation);
+        Ok(CleanupItemOutcome {
+            unit_id: item.unit_id.clone(),
+            outcome: agenttidy_core::cleanup::CleanupOutcome::Failed,
+            reclaimed_bytes: 0,
+            reason: Some("ProviderOperation is not supported by this provider".into()),
+        })
+    }
 }
 
+/// §16.1 path safety shared by `file-set` cleanup units across
+/// providers lives in `agenttidy_infrastructure::paths::validate_transcript_fileset_paths`
+/// (extracted from `providers/claude-code/src/lib.rs::validate_cleanup_unit`).
+/// Provider-specific rules — Codex's DB cross-check, WorkBuddy's
+/// `sessions.deleted_at` consistency — still live in the provider's
+/// own `validate_cleanup_unit` after that helper returns.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +222,120 @@ mod tests {
         fn _assert_boxed(_: Box<dyn AgentProviderAdapter>) {}
         let _ = _assert_dyn_compatible;
         let _ = _assert_boxed;
+    }
+
+    /// Default `execute_provider_operation` must keep the legacy
+    /// "not wired" behaviour for providers that have not opted in
+    /// (Phase 7: only Codex overrides; Claude Code and WorkBuddy
+    /// keep the default). Application-layer dispatch is a no-op for
+    /// these providers but must still report `Failed` (never
+    /// `Removed` / never silently dropped).
+    #[tokio::test]
+    async fn execute_provider_operation_default_returns_failed() {
+        use agenttidy_core::cleanup::{
+            CleanupAction, CleanupItem, CleanupLocator, FileIdentity, ResourceFingerprint,
+            RiskLevel,
+        };
+        use agenttidy_core::installation::{InstallationStatus, Platform};
+        use agenttidy_core::provider::ProviderId;
+        use std::path::PathBuf;
+
+        struct Stub;
+        #[async_trait::async_trait]
+        impl AgentProviderAdapter for Stub {
+            fn id(&self) -> ProviderId {
+                ProviderId::new("stub")
+            }
+            fn display_name(&self) -> &str {
+                "stub"
+            }
+            async fn detect(&self) -> anyhow::Result<Vec<AgentInstallation>> {
+                Ok(Vec::new())
+            }
+            async fn inspect(&self, _: &AgentInstallation) -> anyhow::Result<ProviderInspection> {
+                Ok(ProviderInspection {
+                    version: None,
+                    schema_versions: BTreeMap::new(),
+                    journal_modes: BTreeMap::new(),
+                    agent_running: false,
+                    readable_roots: BTreeMap::new(),
+                    unknown_structures: Vec::new(),
+                    problems: BTreeMap::new(),
+                })
+            }
+            async fn capabilities(
+                &self,
+                _: &ProviderInspection,
+            ) -> anyhow::Result<AgentCapabilities> {
+                Ok(AgentCapabilities::empty())
+            }
+            async fn scan(
+                &self,
+                _: &AgentInstallation,
+                _: &ScanOptions,
+            ) -> anyhow::Result<AgentSnapshot> {
+                Ok(AgentSnapshot {
+                    installation: AgentInstallation {
+                        id: "stub".into(),
+                        provider: ProviderId::new("stub"),
+                        platform: Platform::Macos,
+                        version: None,
+                        data_roots: Vec::new(),
+                        status: InstallationStatus::Available,
+                    },
+                    sessions: Vec::new(),
+                    resources: Vec::new(),
+                    problems: BTreeMap::new(),
+                    completed_at: 0,
+                })
+            }
+        }
+
+        let item = CleanupItem {
+            unit_id: "stub:row:1".into(),
+            installation_id: "stub".into(),
+            provider: ProviderId::new("stub"),
+            fingerprint: ResourceFingerprint {
+                path: PathBuf::from("/tmp/db.sqlite"),
+                identity: FileIdentity {
+                    volume: 0,
+                    index: 0,
+                },
+                size_bytes: 0,
+                mtime_ms: 0,
+            },
+            locator: CleanupLocator::DbRow {
+                database: PathBuf::from("/tmp/db.sqlite"),
+                record_id: "row-1".into(),
+            },
+            estimated_reclaimable_bytes: 0,
+            action: CleanupAction::ProviderOperation,
+            risk: RiskLevel::ReviewRequired,
+            reasons: vec![],
+            preconditions: vec![],
+        };
+        let installation = AgentInstallation {
+            id: "stub".into(),
+            provider: ProviderId::new("stub"),
+            platform: Platform::Macos,
+            version: None,
+            data_roots: Vec::new(),
+            status: InstallationStatus::Available,
+        };
+
+        let outcome = Stub
+            .execute_provider_operation(&item, &installation)
+            .await
+            .expect("default impl must not error");
+        assert_eq!(
+            outcome.outcome,
+            agenttidy_core::cleanup::CleanupOutcome::Failed
+        );
+        assert_eq!(outcome.reclaimed_bytes, 0);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("not supported"));
     }
 }

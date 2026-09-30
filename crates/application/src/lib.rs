@@ -65,6 +65,12 @@ pub struct WorkspaceCleanupCandidate {
 /// The single shared application API for AgentTidy's current read-only flow.
 pub struct Application {
     providers: ProviderRegistry<Box<dyn AgentProviderAdapter>>,
+    /// Cached installations keyed by `installation_id`, populated by
+    /// `cleanup_plan_from_snapshots` and used by `cleanup_execute` to
+    /// resolve an item's `installation_id` back to its full
+    /// `AgentInstallation` (providers need `data_roots` for path
+    /// validation in `execute_provider_operation`, §16.1).
+    installations: std::sync::Mutex<BTreeMap<String, AgentInstallation>>,
 }
 
 impl Application {
@@ -88,7 +94,41 @@ impl Application {
                 Box::new(WorkBuddyAdapter),
             )
             .expect("WorkBuddy registers once");
-        Self { providers }
+        Self {
+            providers,
+            installations: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Look up a cached installation by id. Returns `None` when the
+    /// installation has not been seen by a recent plan-build (the
+    /// caller almost certainly forgot to call
+    /// `cleanup_plan_from_snapshots` first).
+    fn installation_for(&self, installation_id: &str) -> Option<AgentInstallation> {
+        self.installations
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(installation_id).cloned())
+    }
+
+    /// Replace the installation cache with the given snapshot. Called
+    /// by `cleanup_plan_from_snapshots` before building items so the
+    /// executor can resolve `installation_id` back to the full record.
+    fn remember_installations(&self, snapshots: &[AgentSnapshot]) {
+        let mut cache = match self.installations.lock() {
+            Ok(cache) => cache,
+            // A poisoned cache means a previous call panicked while
+            // holding the lock. Recover by clearing it — better to
+            // re-scan than to wedge the executor on a poison.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        cache.clear();
+        for snapshot in snapshots {
+            cache.insert(
+                snapshot.installation.id.clone(),
+                snapshot.installation.clone(),
+            );
+        }
     }
 
     /// Detect every known installation in stable provider order.
@@ -454,6 +494,12 @@ impl Application {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
+        // Cache installations before building items so the executor
+        // can resolve `installation_id` back to the full record when
+        // dispatching `ProviderOperation` (§16.1 path safety needs
+        // `data_roots`).
+        self.remember_installations(snapshots);
+
         // Pre-fetch inspections for every installation in one pass so the
         // policy can read agent_running + schema facts without re-hitting
         // providers per unit.
@@ -652,25 +698,53 @@ impl Application {
             let locator = item.locator.clone();
             let action = item.action;
 
-            // Execute: today only `Trash` is wired. ProviderOperation
-            // returns `Failed` with a clear reason until its own Phase 7
-            // slice (§12.4: DB rows are never a Trash action).
+            // Execute: each action type has its own executor.
+            //
+            // - `Trash` is the OS-recycle flow that always ran here —
+            //   `move_paths_to_trash` moves every member of a `FileSet`
+            //   as one unit (§9.5); per-path results aggregate into one
+            //   honest item outcome (§12.3).
+            // - `ProviderOperation` is dispatched to the provider's
+            //   `execute_provider_operation` trait method (Phase 7 —
+            //   `docs/safety/provider-operation.md`, `Start.md` §12.4).
+            //   Providers that have not opted in keep the legacy
+            //   `Failed("not supported")` default. Provider-specific
+            //   decisions (Codex's native-CLI-first + §12.4 fallback,
+            //   for example) live inside the provider, not here —
+            //   Application stays policy-only, no per-provider logic
+            //   (red line #2).
             let (outcome, reclaimed_bytes, reason) = match action {
                 CleanupAction::Trash => {
-                    // A FileSet item moves *every* member path as one
-                    // unit (§9.5); per-path results are aggregated into
-                    // one honest item outcome (§12.3).
                     let paths: Vec<PathBuf> = item.locator.paths().into_iter().cloned().collect();
                     aggregate_trash_results(
                         &trash::move_paths_to_trash(&paths),
                         item.estimated_reclaimable_bytes,
                     )
                 }
-                CleanupAction::ProviderOperation => (
-                    CleanupOutcome::Failed,
-                    0,
-                    Some("ProviderOperation is not yet wired (Phase 7)".into()),
-                ),
+                CleanupAction::ProviderOperation => {
+                    let provider = self.providers.get(&item.provider).ok_or_else(|| {
+                        anyhow::anyhow!("no registered adapter for provider {:?}", item.provider)
+                    })?;
+                    let installation =
+                        self.installation_for(&item.installation_id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "no installation registered for id {:?}",
+                                    item.installation_id
+                                )
+                            })?;
+                    match provider
+                        .execute_provider_operation(item, &installation)
+                        .await
+                    {
+                        Ok(outcome) => (outcome.outcome, outcome.reclaimed_bytes, outcome.reason),
+                        Err(error) => (
+                            CleanupOutcome::Failed,
+                            0,
+                            Some(format!("provider operation failed: {error}")),
+                        ),
+                    }
+                }
             };
 
             // Audit log entry — best-effort; a log failure aborts this item
@@ -1945,5 +2019,145 @@ mod tests {
             None => std::env::remove_var("USERPROFILE"),
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `CleanupAction::ProviderOperation` is now routed through each
+    /// provider's `execute_provider_operation` trait method (Phase 7).
+    /// All three v0.1 providers keep the trait's default impl, which
+    /// returns `Failed("not supported")` — this test pins that
+    /// behaviour so the dispatch contract is locked at the
+    /// application layer, not just inside each provider. Codex will
+    /// override the method in commit 5; Claude Code and WorkBuddy
+    /// keep the default until they opt into `ProviderOperation`.
+    #[tokio::test]
+    async fn execute_provider_operation_routes_to_adapter_default_failed() {
+        use agenttidy_core::cleanup::{
+            CleanupAction, CleanupItem, CleanupLocator, FileIdentity, ResourceFingerprint,
+            RiskLevel,
+        };
+        use agenttidy_core::provider::ProviderId;
+
+        // Use the same fake-HOME / fake-USERPROFILE isolation as the
+        // Trash test so the audit log writes to a temp dir rather than
+        // touching the real user profile.
+        let audit_root = std::env::temp_dir().join(format!(
+            "agenttidy-execute-providerop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&audit_root).unwrap();
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &audit_root);
+
+        // Revalidation walks the fingerprint path, so create a real
+        // (empty) file the executor can stat. We are not testing the
+        // SQL layer here — only the dispatch table.
+        let db_path = audit_root.join("state_5.sqlite");
+        std::fs::write(&db_path, b"").unwrap();
+        let metadata = std::fs::symlink_metadata(&db_path).unwrap();
+        let mtime_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let identity = agenttidy_infrastructure::fs_probe::file_identity(&db_path)
+            .expect("identity for empty db");
+
+        let app = Application::new();
+
+        // Build a minimal plan by hand: one ProviderOperation item
+        // (no scan needed — we exercise the dispatch table directly).
+        let item = CleanupItem {
+            unit_id: "codex:row:demo".into(),
+            installation_id: "codex:default".into(),
+            provider: ProviderId::new(ProviderId::CODEX),
+            fingerprint: ResourceFingerprint {
+                path: db_path.clone(),
+                identity: FileIdentity {
+                    volume: identity.volume,
+                    index: identity.index,
+                },
+                size_bytes: metadata.len(),
+                mtime_ms,
+            },
+            locator: CleanupLocator::DbRow {
+                database: db_path.clone(),
+                record_id: "demo-thread".into(),
+            },
+            estimated_reclaimable_bytes: 0,
+            action: CleanupAction::ProviderOperation,
+            risk: RiskLevel::ReviewRequired,
+            reasons: vec![],
+            preconditions: vec![],
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let plan = CleanupPlan {
+            id: format!("{:016x}{:08x}", now_ms, 1),
+            scan_id: "test".into(),
+            created_at: now_ms,
+            expires_at: Some(now_ms + 5 * 60 * 1000),
+            items: vec![item.clone()],
+            total_reclaimable_bytes: 0,
+            risk_summary: RiskSummary::default(),
+            fingerprint: "test-fingerprint".into(),
+        };
+
+        // Cache the installation referenced by the item so the
+        // executor can resolve it (mirrors what
+        // `cleanup_plan_from_snapshots` does on the real path).
+        let installation = AgentInstallation {
+            id: "codex:default".into(),
+            provider: ProviderId::new(ProviderId::CODEX),
+            platform: agenttidy_core::installation::Platform::Macos,
+            version: None,
+            data_roots: vec![audit_root.to_string_lossy().into_owned()],
+            status: agenttidy_core::installation::InstallationStatus::Available,
+        };
+        app.remember_installations(&[AgentSnapshot {
+            installation,
+            sessions: Vec::new(),
+            resources: Vec::new(),
+            problems: BTreeMap::new(),
+            completed_at: now_ms,
+        }]);
+
+        let results = app
+            .cleanup_execute(
+                &plan,
+                &plan.fingerprint,
+                std::slice::from_ref(&item.unit_id),
+            )
+            .await
+            .expect("executor dispatches ProviderOperation through adapter");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].outcome,
+            CleanupOutcome::Failed,
+            "default ProviderOperation impl must report Failed (Codex overrides in commit 5)"
+        );
+        assert_eq!(results[0].reclaimed_bytes, 0);
+        assert!(
+            results[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("not supported"),
+            "reason must point at the default impl's message"
+        );
+
+        // Cleanup fake HOME.
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&audit_root).ok();
     }
 }

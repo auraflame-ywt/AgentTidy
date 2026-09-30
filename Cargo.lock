@@ -91,6 +91,7 @@ name = "agenttidy-infrastructure"
 version = "0.1.0"
 dependencies = [
  "agenttidy-core",
+ "anyhow",
  "rusqlite",
  "serde",
  "serde_json",
@@ -110,6 +111,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
