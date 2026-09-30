@@ -193,7 +193,7 @@ Codex Desktop / Codex app creates **default per-day workspace dirs under `%USERP
 ## Open questions (Phase 0 continues)
 
 - [x] Windows path (`%USERPROFILE%\.codex` verified 2026-09-20; also whether the default workspace is `%USERPROFILE%\Documents\Codex\` on Windows — verified).
-- [ ] Does Codex expose a native "delete thread" that also fixes DB? (protocol investigation)
+- [x] Does Codex expose a native "delete thread" that also fixes DB? **Yes** — `codex delete <SESSION>` (verified in codex-cli 0.152.0, `codex delete --help`: "Permanently delete a saved session by id or session name"). This is the Application-layer's preferred path for `CleanupAction::ProviderOperation`; the §12.4 self-implementation (backup → BEGIN IMMEDIATE → DELETE → FK check) remains as a fallback when the binary is unavailable, fails, or behaves unexpectedly. Both paths are documented in [`../safety/provider-operation.md`](../safety/provider-operation.md).
 - [ ] `logs_2.sqlite` rotation/retention policy (does Codex ever prune it?).
 - [ ] Behavior of `attachments/` when its thread is archived (moved or left?).
 - [ ] When are `%USERPROFILE%\Documents\Codex\YYYY-MM-DD\<chat>\` dirs created vs a user-picked cwd? (default-workspace trigger conditions)
