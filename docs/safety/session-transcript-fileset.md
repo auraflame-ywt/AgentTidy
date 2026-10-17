@@ -98,11 +98,14 @@ Execution holds the cross-process operation guard
 (`$HOME/.agenttidy/operations.lock`) for the whole batch: a second GUI
 window or CLI instance cannot execute concurrently. A live Claude
 process blocks execution at both policy (`agent-running`) and
-revalidation (`no-agent-running`) time. A file locked by another process
-on Windows surfaces as a platform trash error and the item is reported
-`failed` with the verbatim error — the `skipped`-for-locked distinction
-requires reliable OS error codes and remains Phase 7 hardening
-(`trash.rs` notes the same).
+revalidation (`no-agent-running`) time. A file locked by another
+process is classified by the platform error code
+(`ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`, raw and HRESULT
+forms) into `TrashOutcome::Locked`: when it is the only failure and
+nothing has moved yet, the item is reported `skipped` with a
+close-the-holder-and-retry hint (transient condition); a lock that
+arrives after other members already moved keeps the honest `failed`
+(§12.3 — a partially-moved file set is never a clean skip).
 
 ## Audit log (§16.3)
 

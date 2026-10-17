@@ -18,6 +18,10 @@
         "unrecognized-transcript:<TEST_HOME>/.workbuddy/projects/-Users-x-AgentTidy/d493ed8f-0147-4c01-89df-b9da4b956532.jsonl": {
           "message": "expected value at line 1 column 1",
           "severity": "warning"
+        },
+        "workbuddy-db-unavailable": {
+          "message": "database not found: <TEST_HOME>/.workbuddy/workbuddy.db",
+          "severity": "warning"
         }
       },
       "resources": [

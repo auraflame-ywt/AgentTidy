@@ -152,6 +152,7 @@ export const zh: Record<TranslationKey, string> = {
   "review.item.recoverable.providerOperation": "不可通过回收站恢复",
   "review.item.members.one": "单元包含 1 个路径",
   "review.item.members.other": "单元包含 {count} 个路径",
+  "review.item.record": "数据库记录",
 
   // --- ReviewConfirm modal ---
   "confirm.title": "确认清理",

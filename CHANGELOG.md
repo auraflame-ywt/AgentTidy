@@ -41,8 +41,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   promises, and the view is reset after execution so the next run
   requires a fresh preview. Plan expiry (5-min TTL) now gates both CTAs
   with a "plan expired — rescan" notice, checked live at click time.
+- **Phase 7 second cleanup slice — Codex archived-session
+  `ProviderOperation` beta** (gated by the new
+  `docs/safety/provider-operation.md`): `AgentProviderAdapter` gains
+  `execute_provider_operation` (default `Failed("not supported")`) and
+  the executor dispatches `CleanupAction::ProviderOperation` items to
+  it. Codex emits one `DbRow`-locator unit per archived, exclusively-
+  owned session; execution prefers the native `codex delete <id>` CLI
+  (verified against codex-cli 0.152.0) and falls back to the §12.4
+  self-implementation: verified backup (`VACUUM INTO` +
+  `quick_check`) → writable private temp copy → `BEGIN IMMEDIATE`
+  coordinated delete of `threads` / `thread_attachments` /
+  `thread_spawn_edges` → `wal_checkpoint` + integrity gates → atomic
+  rename over the agent's source DB. Recovery is from the SQLite
+  backup under `~/.agenttidy/backup/`, never branded "Move to Trash"
+  (§12.4 / red line #8). `inspect()` now surfaces `state_5`
+  `user_version` + journal mode.
+- **Phase 7 third cleanup slice — WorkBuddy session `FileSet` beta**
+  (gated by the new `docs/safety/workbuddy-session-fileset.md`; the
+  `sessions` table contract is frozen as v1 in
+  `fixtures/workbuddy/db/sessions-schema.json`): scan now derives
+  session lifecycle from the database — `deleted_at IS NOT NULL` ⇒
+  `Archived`, recognized terminal statuses ⇒ `Inactive`, anything
+  else (including a missing/drifted/unreadable DB) stays `Unknown`
+  fail-closed. Cleanup units are file-only `Trash` actions for
+  Inactive/Archived sessions (transcript + side dir + `.meta.json` +
+  `.file-rollback.ndjson`; no DB rows are mutated) with a
+  plan-build cross-check that the `sessions` row still maps to a
+  cleanable lifecycle. `automations.cwds` is read (contract v1) to
+  expose `automation_cwd_refs` on the workspace resource, and the
+  shared §16.1 path-safety block lives in
+  `infrastructure::paths::validate_transcript_fileset_paths`.
 
 ### Fixed
+
+- Windows locked-file classification (§16.2 / §12.3): a member held
+  open by another process is now recognized from the platform error
+  code (`ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`, raw and
+  HRESULT forms) as `TrashOutcome::Locked` — a locked-only failure
+  with nothing moved reports `skipped` with a close-the-holder-and-retry
+  hint instead of a bare `failed`, while a lock arriving after other
+  members already moved keeps the honest `failed` (a partially-moved
+  file set is never a clean skip).
 
 - The cleanup executor now actually enforces the plan TTL it documents:
   `cleanup_revalidate` marks every item of an expired plan `skipped` and

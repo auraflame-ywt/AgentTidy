@@ -167,6 +167,7 @@ export const en = {
   "review.item.recoverable.providerOperation": "Not trash-recoverable",
   "review.item.members.one": "1 path in this unit",
   "review.item.members.other": "{count} paths in this unit",
+  "review.item.record": "DB record",
 
   // --- ReviewConfirm modal ---
   "confirm.title": "Confirm cleanup",

@@ -132,6 +132,7 @@ Deleting a transcript while leaving `sessions` row (or vice versa) creates dangl
 ## Databases & schema
 
 - `workbuddy.db` (Drizzle ORM, WAL). Tables: `sessions`, `workspaces`, `session_usage`, `buddy_snapshots`, `automations`, `automation_runs`, `automation_delivery_outbox`, `automation_runtime_state`, migration tables.
+- **`sessions` table contract — frozen v1 (2026-09-30, Phase 7)**: columns `id, cwd, user_id, title, status, created_at, updated_at, deleted_at, source_mode, model, project_id, buddy_snapshot_id` (see `fixtures/workbuddy/db/sessions-schema.json` for the sanitized snapshot with types/nullability). AgentTidy reads only `id, deleted_at, status, updated_at` for lifecycle inference: `deleted_at IS NOT NULL` ⇒ `Archived`; recognized terminal status (`completed`/`archived`/`error`/`terminated`) ⇒ `Inactive`; anything else ⇒ `Unknown` (fail-closed, `docs/safety/workbuddy-session-fileset.md`). The `automations.cwds` JSON array is also read (contract v1) to expose `automation_cwd_refs` on the workspace resource.
 - `edge-sync-mapping-v{1..4}.db` — separate sync DBs, generation-numbered, all present simultaneously with their own WAL files.
 
 ## Runtime write behavior
@@ -141,7 +142,7 @@ Deleting a transcript while leaving `sessions` row (or vice versa) creates dangl
 
 ## Atomic cleanup units
 
-- ✅ Candidate: transcript `projects/<slug>/<uuid>.jsonl` + `<uuid>/` side dir + `<uuid>.meta.json` + `<uuid>.file-rollback.ndjson` (full session file set), **only for sessions with `deleted_at IS NOT NULL`** and consistent `session_usage` — still requires DB row handling per red line #7/#8 (v0.1 read-only: report only).
+- ✅ **Enabled (Phase 7 beta)**: transcript `projects/<slug>/<uuid>.jsonl` + `<uuid>/` side dir + `<uuid>.meta.json` + `<uuid>.file-rollback.ndjson` (full session file set) for sessions whose DB-derived lifecycle is `Inactive`/`Archived` (`deleted_at IS NOT NULL` ⇒ Archived; terminal status ⇒ Inactive). Action is `Trash` (file-owned); **no DB rows are mutated** — the `sessions` row stays and the plan-build cross-check (`validate_cleanup_unit`) re-reads it fail-closed. See `docs/safety/workbuddy-session-fileset.md`.
 - ✅ Candidate: `edge-sync-mapping-v1..v3.db(+wal/shm)` superseded generations (needs app-not-running + v4 healthy check).
 - ❌ Not units: `binaries/`, `app/`, `plugins/` (program files), `blobs/` (shared, content-addressed, no verified back-refs), `audit-log/`, `models.json`, persona files.
 

@@ -1,0 +1,38 @@
+{
+  "_doc": "Sanitized snapshot of the WorkBuddy `sessions` table contract (v1, frozen 2026-09-30). Column names, types and nullability match a real WorkBuddy 5.5.6 database (Drizzle ORM, WAL mode) sampled in Phase 0 — no row content, no user identifiers. AgentTidy's provider reads exactly these columns to derive session lifecycle; any schema drift must fail-closed (SchemaUnchanged precondition, docs/safety/workbuddy-session-fileset.md).",
+  "database": "workbuddy.db",
+  "table": "sessions",
+  "contract_version": "v1",
+  "frozen_at": "2026-09-30",
+  "columns": [
+    { "name": "id", "type": "TEXT", "nullable": false, "role": "primary key; equals the transcript filename stem under projects/<slug>/" },
+    { "name": "cwd", "type": "TEXT", "nullable": true, "role": "session working directory; slug-maps to <slug> in the transcript path" },
+    { "name": "user_id", "type": "TEXT", "nullable": true, "role": "not read by AgentTidy" },
+    { "name": "title", "type": "TEXT", "nullable": true, "role": "session title" },
+    { "name": "status", "type": "TEXT", "nullable": true, "role": "observed values: completed / archived / error / terminated; unrecognized values map to lifecycle Unknown (fail-closed)" },
+    { "name": "created_at", "type": "INTEGER", "nullable": true, "role": "epoch milliseconds" },
+    { "name": "updated_at", "type": "INTEGER", "nullable": true, "role": "epoch milliseconds; doubles as archived_at for soft-deleted rows" },
+    { "name": "deleted_at", "type": "INTEGER", "nullable": true, "role": "NULL = live; NOT NULL = user-soft-deleted in the app (transcript stays on disk)" },
+    { "name": "source_mode", "type": "TEXT", "nullable": true, "role": "observed values: working / craft / design; not read for cleanup" },
+    { "name": "model", "type": "TEXT", "nullable": true, "role": "model identifier; not read" },
+    { "name": "project_id", "type": "TEXT", "nullable": true, "role": "not read by AgentTidy" },
+    { "name": "buddy_snapshot_id", "type": "TEXT", "nullable": true, "role": "persona snapshot reference; not read" }
+  ],
+  "related_tables_read_only": [
+    {
+      "table": "automations",
+      "contract_version": "v1",
+      "columns_read": [{ "name": "cwds", "type": "TEXT", "role": "JSON array of workspace cwd paths an automation operates on; AgentTidy reads it only to decide whether a workspace is referenced (blocked) or not" }]
+    }
+  ],
+  "tables_never_touched": [
+    "session_usage",
+    "workspaces",
+    "buddy_snapshots",
+    "automation_runs",
+    "automation_delivery_outbox",
+    "automation_runtime_state",
+    "__workbuddy_drizzle_migrations",
+    "migration_meta"
+  ]
+}

@@ -1,0 +1,3 @@
+{"sessionId":"<session-id>","seq":1,"timestamp":1782397990000,"kind":"file-edit","path":"<cwd-slug>/src/main.rs","before":"<content-hash>","after":"<content-hash>"}
+{"sessionId":"<session-id>","seq":2,"timestamp":1782398010000,"kind":"file-create","path":"<cwd-slug>/notes.md","after":"<content-hash>"}
+{"sessionId":"<session-id>","seq":3,"timestamp":1782398040000,"kind":"file-delete","path":"<cwd-slug>/tmp-debug.log","before":"<content-hash>"}

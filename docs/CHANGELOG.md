@@ -16,7 +16,7 @@
 | Phase 4：CLI Validation | 已完成（只读初版） | CLI 已提供版本化 JSON 契约、文本诊断、真实扫描与 12 个端到端 golden；清理与候选预览保留给 Phase 6/7。 |
 | Phase 5：GUI Read-only Experience | 已完成（只读初版） | Tauri 2 IPC + React 三视图（Overview / Sessions / Diagnostics）已接入 Application API；清理与候选预览保留给 Phase 6/7。 |
 | Phase 6：Cleanup Model | 已完成（framework-only 初版） | 清理领域模型、策略、重新验证、审计日志、IPC 与 GUI Review 视图已落地；三个 provider 均未产出 Cleanup Unit，真实清理归 Phase 7。 |
-| Phase 7：首个 Provider Cleanup Beta | 进行中 | Claude Code transcript FileSet Beta 已落地（安全文档 + 单元构建/校验 + 多路径回收站 + Operation guard + 生命周期策略）；Codex ProviderOperation 与 WorkBuddy 表契约未开始。 |
+| Phase 7：首个 Provider Cleanup Beta | 进行中（代码切片全部落地） | 三个 provider 的清理切片均已落地：Claude Code transcript FileSet Beta、Codex archived-session `ProviderOperation` Beta（native `codex delete` 优先 + §12.4 自实现兜底）、WorkBuddy sessions v1 契约冻结 + FileSet Beta；Windows 锁定文件 `skipped` 分类已实现。剩余：小范围真实用户 Beta 与 Trash/Recovery/Compatibility 跨平台验证。 |
 | Phase 8：逐 Provider 扩展 | 未开始 | 按 Provider 分别通过安全门槛后推进。 |
 
 ## 已完成里程碑
@@ -198,18 +198,51 @@
   每一项报 `skipped`，`cleanup_execute` 直接拒绝执行，堵住裸 IPC 绕过
   GUI 过期门禁的口子（§12.2）。
 
+### Phase 7 后续切片（2026-09-30）
+
+- **Codex `ProviderOperation` Beta**（`docs/safety/provider-operation.md`）：
+  `AgentProviderAdapter` 新增 `execute_provider_operation` trait 方法
+  （默认 `Failed("not supported")`，不破坏未接入 provider）；Application
+  层 `cleanup_execute` 的 `ProviderOperation` 分支从 Phase 6 stub 改为
+  dispatch 到 adapter。Codex 侧：`build_cleanup_units` 对 archived +
+  exclusive session 产出 `DbRow` locator 单元（`state_5.sqlite` 缺失时
+  fail-closed 不发单元）；`validate_cleanup_unit` 校验 database 在
+  data roots 内；执行路径优先 `codex delete <id>`（protocol
+  investigation 关闭了 Open Question，codex-cli 0.152.0 验证），CLI
+  不可用时走 §12.4 自实现：`backup_sqlite_with_sidecars`（VACUUM INTO +
+  quick_check 门）→ `MutableSqliteDb::open_mutable_on_temp_copy`（类型
+  系统保证永不直接打开 agent 源 DB 写）→ BEGIN IMMEDIATE 事务删除
+  `threads` / `thread_attachments` / `thread_spawn_edges` →
+  wal_checkpoint + quick_check → 原子 rename 回源文件；备份路径写入
+  audit `reason`。`inspect()` 现在输出 `state_5` 的 `user_version` +
+  journal mode（`SchemaUnchanged` 依赖）。
+- **WorkBuddy sessions v1 契约冻结 + FileSet Beta**
+  （`docs/safety/workbuddy-session-fileset.md`、
+  `fixtures/workbuddy/db/sessions-schema.json`）：scan 从 `sessions` 表
+  推导 lifecycle（`deleted_at NOT NULL` → Archived；终态 status →
+  Inactive；其余 Unknown fail-closed）；`automations.cwds` 读出后挂到
+  workspace 资源的 `automation_cwd_refs` metadata；契约漂移
+  （列集不匹配 v1）时跳过推断。`build_cleanup_units` 对 Inactive/
+  Archived session 产出 FileSet 单元（Trash 动作，DB 行不改动）；
+  `validate_cleanup_unit` 复用 infrastructure 的
+  `validate_transcript_fileset_paths`（§16.1 通用路径安全，从 Claude
+  Code 抽取）+ DB 行存在性交叉校验。
+- **Windows 锁定文件 `skipped` vs `failed` 分类**：`TrashOutcome` 新增
+  `Locked` 变体（`ERROR_SHARING_VIOLATION`/`ERROR_LOCK_VIOLATION` 及
+  HRESULT 形式）；聚合规则——仅锁定且无成员移动 → `Skipped`（提示关闭
+  占用进程后重试）；锁定出现在部分成员已移动之后 → 诚实 `Failed`
+  （§12.3）；其他平台错误 → `Failed`（原文错误）。
+- 测试：Codex provider 7 项（含 §12.4 端到端集成）、WorkBuddy
+  provider 6 项（契约冻结 + lifecycle 推断 + 单元构建 + 行缺失拒绝）、
+  infrastructure（backup 3 项 + MutableSqliteDb 2 项 + fileset helper
+  6 项 + lock 分类 1 项）、application（dispatch 契约 + 锁定聚合）。
+
 ## 下一步
 
-### Phase 7 后续切片
+### Phase 7 收尾（剩余验收项）
 
-- Codex session JSONL `FileSet` 与 `state_5.sqlite.threads` 行的协调
-  `ProviderOperation`（含 §12.4 数据库操作纪律）；workspace 仍因 §2.3
-  保持 Blocked；
-- WorkBuddy：先冻结 `sessions` 表契约再谈生命周期与单元；
-- Windows 锁定文件的 `skipped` vs `failed` 错误码分类（需可靠 OS 错误
-  码，当前按原文报 failed）；
 - 小范围真实用户 Beta 与 Trash/Recovery/Compatibility 跨平台验证
-  （Start.md §19 Phase 7 验收项）。
+  （Start.md §19 Phase 7 验收项；macOS 已绿，Windows 需 CI + 真机）。
 
 ### Phase 8：逐 Provider 扩展（待启动）
 

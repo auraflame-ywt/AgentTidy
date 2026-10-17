@@ -1,0 +1,11 @@
+{
+  "_doc": "Sanitized sample of the `<session-id>.meta.json` sidecar that sits next to a WorkBuddy transcript under projects/<slug>/ (fixtures/README.md: sanitized samples of real data, never hand-crafted content). Keys and shapes match a real WorkBuddy 5.5.6 host-connection metadata sidecar; all identifiers and paths are placeholders.",
+  "sessionId": "<session-id>",
+  "hostConnection": {
+    "interface": "ide",
+    "client": "<sanitized>",
+    "connectedAt": 1782397989000,
+    "disconnectedAt": 1782398050000
+  },
+  "entrypoint": "workspace-panel"
+}

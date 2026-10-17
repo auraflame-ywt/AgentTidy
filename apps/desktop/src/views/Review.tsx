@@ -377,6 +377,18 @@ export default function Review({
                           </ul>
                         </details>
                       ) : null}
+                      {/* Codex ProviderOperation units carry a `db-row`
+                          locator: surface the record id + database so the
+                          user sees exactly which thread row is targeted
+                          (docs/safety/provider-operation.md). */}
+                      {item.locator.kind === "db-row" ? (
+                        <span
+                          className="truncate rounded bg-neutral-100 px-1.5 py-0.5 font-mono"
+                          title={item.locator.database}
+                        >
+                          {t("review.item.record")} {item.locator.record_id}
+                        </span>
+                      ) : null}
                     </div>
                   </div>
                   <span className="text-xs tabular-nums text-neutral-700">
