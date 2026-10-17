@@ -243,11 +243,29 @@ impl Application {
                         matches.len()
                     ));
                 }
-                // WorkBuddy has automations that can reference arbitrary cwd.
-                // Its adapter does not yet expose that table's contract, so
-                // absence cannot be proven and must block the candidate.
+                // WorkBuddy has automations that can reference arbitrary
+                // cwds. Since Phase 7 the adapter reads the frozen
+                // `automations.cwds` contract and exposes the union on the
+                // workspace resource as `automation_cwd_refs`: absent ⇒
+                // not provable, block (fail-closed); present and matching
+                // this cwd ⇒ an automation still targets it, block;
+                // present without this cwd ⇒ provably unreferenced.
                 if workspace.provider.as_str() == ProviderId::WORKBUDDY {
-                    blockers.push("WorkBuddy automation references are not yet verified".into());
+                    match workspace.metadata.get("automation_cwd_refs") {
+                        None => blockers
+                            .push("WorkBuddy automation references are not yet verified".into()),
+                        Some(serde_json::Value::Array(refs)) => {
+                            let referenced = refs
+                                .iter()
+                                .any(|value| value.as_str().is_some_and(|cwd| cwd == path));
+                            if referenced {
+                                blockers.push("WorkBuddy automation references this cwd".into());
+                            }
+                        }
+                        Some(_) => {
+                            blockers.push("WorkBuddy automation references are malformed".into())
+                        }
+                    }
                 }
                 candidates.push(WorkspaceCleanupCandidate {
                     installation_id: snapshot.installation.id.clone(),
@@ -848,16 +866,26 @@ fn scan_id_for(snapshots: &[AgentSnapshot]) -> String {
 /// `estimated` is the unit's reclaim estimate, recorded only when at
 /// least one member actually moved; `AlreadyGone` / `NotFound` count as
 /// idempotent no-ops, never as fresh success.
+///
+/// Lock classification (`docs/safety/session-transcript-fileset.md`
+/// Concurrency): members held open by another process report `Locked`.
+/// A **locked-only** failure with nothing moved is transient — the
+/// item is `Skipped` with a retry hint rather than `Failed`. Any
+/// non-locked failure, or a lock that arrives *after* some members
+/// already moved, keeps the honest `Failed`: a partial FileSet is not
+/// the measured unit and must never look like a clean skip.
 fn aggregate_trash_results(
     results: &[PathTrashResult],
     estimated: u64,
 ) -> (CleanupOutcome, u64, Option<String>) {
     let mut removed = 0usize;
+    let mut locked: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     for (path, result) in results {
         match result {
             Ok(TrashOutcome::Removed) => removed += 1,
             Ok(TrashOutcome::AlreadyGone) | Err(TrashError::NotFound(_)) => {}
+            Ok(TrashOutcome::Locked) => locked.push(path.display().to_string()),
             Ok(TrashOutcome::PlatformError(message)) => {
                 failures.push(format!("{}: {message}", path.display()));
             }
@@ -881,6 +909,31 @@ fn aggregate_trash_results(
             CleanupOutcome::Failed,
             0,
             Some(format!("{partial}{}", failures.join("; "))),
+        );
+    }
+    if !locked.is_empty() {
+        if removed > 0 {
+            // Some members moved, the rest are locked — the unit is
+            // partially moved, not cleanly skipped (§12.3 honesty).
+            return (
+                CleanupOutcome::Failed,
+                0,
+                Some(format!(
+                    "{removed}/{} member(s) moved to trash; the rest are locked by \
+                     another process: {}",
+                    results.len(),
+                    locked.join("; ")
+                )),
+            );
+        }
+        // Locked-only, nothing moved: transient, retryable.
+        return (
+            CleanupOutcome::Skipped,
+            0,
+            Some(format!(
+                "file locked by another process: {} — close the holder and retry",
+                locked.join("; ")
+            )),
         );
     }
     if removed > 0 {
@@ -1070,6 +1123,56 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    /// Serializes tests that mutate the process-global HOME / PATH
+    /// env vars *and* acquire the cross-process operation guard.
+    /// `cleanup_execute` resolves both the guard path and the audit
+    /// log path from `$HOME`, so two concurrent execute-tests stomp
+    /// each other's env and the guard then sees its own pid in a
+    /// leftover lock file ("another cleanup operation is in
+    /// progress"). Tests that don't touch env or the guard don't
+    /// need this lock. Async-aware (`tokio::sync::Mutex`) because
+    /// the guarded test bodies hold it across `.await` points.
+    static EXECUTE_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Locked-only trash failures aggregate to `Skipped` with a retry
+    /// hint; a lock arriving after other members already moved stays
+    /// `Failed` (a partially-moved FileSet is never a clean skip).
+    /// `docs/safety/session-transcript-fileset.md` Concurrency.
+    #[test]
+    fn aggregate_locked_paths_yield_skipped_outcome() {
+        use agenttidy_infrastructure::trash::TrashOutcome;
+        use std::path::PathBuf;
+
+        let locked_only = vec![
+            (PathBuf::from("/tmp/a.jsonl"), Ok(TrashOutcome::Locked)),
+            (PathBuf::from("/tmp/a"), Ok(TrashOutcome::Locked)),
+        ];
+        let (outcome, bytes, reason) = aggregate_trash_results(&locked_only, 100);
+        assert_eq!(outcome, CleanupOutcome::Skipped);
+        assert_eq!(bytes, 0);
+        let reason = reason.expect("locked skip carries a reason");
+        assert!(
+            reason.contains("file locked by another process"),
+            "unexpected reason: {reason}"
+        );
+
+        // Mixed: one member moved, the other locked — honest partial
+        // failure, not a skip.
+        let partial = vec![
+            (PathBuf::from("/tmp/b.jsonl"), Ok(TrashOutcome::Removed)),
+            (PathBuf::from("/tmp/b"), Ok(TrashOutcome::Locked)),
+        ];
+        let (outcome, bytes, reason) = aggregate_trash_results(&partial, 100);
+        assert_eq!(outcome, CleanupOutcome::Failed);
+        assert_eq!(bytes, 0);
+        assert!(
+            reason
+                .unwrap_or_default()
+                .contains("locked by another process"),
+            "mixed outcome must name the locked member"
+        );
+    }
+
     #[test]
     fn static_registry_contains_the_three_v01_providers() {
         let app = Application::new();
@@ -1167,6 +1270,59 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("automation references")));
+    }
+
+    /// Phase 7: with the frozen `automations.cwds` contract read into
+    /// `automation_cwd_refs`, a workspace the automations do *not*
+    /// reference loses the automation blocker (the remaining
+    /// eligibility rules still apply); one they *do* reference stays
+    /// blocked with the targeted reason.
+    #[test]
+    fn workbuddy_workspace_automation_refs_decide_the_blocker() {
+        let mut snapshot = snapshot_with_workspace(
+            ProviderId::WORKBUDDY,
+            "/Users/example/WorkBuddy/task-a",
+            &["/Users/example/WorkBuddy/task-a"],
+            true,
+        );
+        let workspace = &mut snapshot.resources[0];
+        workspace.metadata.insert(
+            "automation_cwd_refs".into(),
+            serde_json::Value::Array(vec![serde_json::Value::String(
+                "/Users/example/other/project".into(),
+            )]),
+        );
+        let candidates = Application::workspace_cleanup_candidates_from_snapshots(&[snapshot]);
+        assert!(
+            candidates[0]
+                .blockers
+                .iter()
+                .all(|blocker| !blocker.contains("automation")),
+            "unreferenced cwd must not carry an automation blocker: {:?}",
+            candidates[0].blockers
+        );
+        assert!(candidates[0].eligible);
+
+        // Referenced cwd ⇒ blocked with the targeted reason.
+        let mut snapshot = snapshot_with_workspace(
+            ProviderId::WORKBUDDY,
+            "/Users/example/WorkBuddy/task-a",
+            &["/Users/example/WorkBuddy/task-a"],
+            true,
+        );
+        let workspace = &mut snapshot.resources[0];
+        workspace.metadata.insert(
+            "automation_cwd_refs".into(),
+            serde_json::Value::Array(vec![serde_json::Value::String(
+                "/Users/example/WorkBuddy/task-a".into(),
+            )]),
+        );
+        let candidates = Application::workspace_cleanup_candidates_from_snapshots(&[snapshot]);
+        assert!(!candidates[0].eligible);
+        assert!(candidates[0]
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("automation references this cwd")));
     }
 
     #[test]
@@ -1908,6 +2064,9 @@ mod tests {
     /// must exist either way.
     #[tokio::test]
     async fn execute_trashes_fileset_item_and_writes_audit_row() {
+        // Env-mutating + guard-acquiring test — serialize against the
+        // ProviderOperation dispatch test (see EXECUTE_ENV_MUTEX).
+        let _env = EXECUTE_ENV_MUTEX.lock().await;
         let dir = std::env::temp_dir().join(format!(
             "agenttidy-execute-{}-{}",
             std::process::id(),
@@ -2021,14 +2180,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `CleanupAction::ProviderOperation` is now routed through each
-    /// provider's `execute_provider_operation` trait method (Phase 7).
-    /// All three v0.1 providers keep the trait's default impl, which
-    /// returns `Failed("not supported")` — this test pins that
-    /// behaviour so the dispatch contract is locked at the
-    /// application layer, not just inside each provider. Codex will
-    /// override the method in commit 5; Claude Code and WorkBuddy
-    /// keep the default until they opt into `ProviderOperation`.
+    /// `CleanupAction::ProviderOperation` is routed through each
+    /// provider's `execute_provider_operation` trait method (Phase 7
+    /// commit 5: Codex overrides; Claude Code and WorkBuddy keep the
+    /// default `Failed("not supported")`). This test pins the
+    /// dispatch contract at the application layer: the item must
+    /// reach the *real* Codex override, which fail-closes on the
+    /// bogus fixture database (an empty file, not a SQLite DB) and
+    /// reports `Failed` with a provider-sourced reason.
     #[tokio::test]
     async fn execute_provider_operation_routes_to_adapter_default_failed() {
         use agenttidy_core::cleanup::{
@@ -2036,6 +2195,10 @@ mod tests {
             RiskLevel,
         };
         use agenttidy_core::provider::ProviderId;
+
+        // Env-mutating + guard-acquiring test — serialize against the
+        // FileSet trash test (see EXECUTE_ENV_MUTEX).
+        let _env = EXECUTE_ENV_MUTEX.lock().await;
 
         // Use the same fake-HOME / fake-USERPROFILE isolation as the
         // Trash test so the audit log writes to a temp dir rather than
@@ -2051,6 +2214,24 @@ mod tests {
         std::fs::create_dir_all(&audit_root).unwrap();
         let previous_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &audit_root);
+        // Point PATH at the empty dir *plus the system dirs* so the
+        // Codex override's native-CLI probe finds no binary and goes
+        // straight to the §12.4 self-implementation — while the
+        // macOS trash helper's `osascript` (resolved via PATH, and
+        // used by the concurrent FileSet trash test) keeps working.
+        // (`codex` itself lives under ~/.nvm or /opt/homebrew, never
+        // /usr/bin, so the probe still misses.)
+        let empty_path = std::env::temp_dir().join(format!(
+            "agenttidy-empty-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&empty_path).unwrap();
+        let previous_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", empty_path.display()));
 
         // Revalidation walks the fingerprint path, so create a real
         // (empty) file the executor can stat. We are not testing the
@@ -2138,26 +2319,36 @@ mod tests {
             .expect("executor dispatches ProviderOperation through adapter");
 
         assert_eq!(results.len(), 1);
+        // The fixture `state_5.sqlite` is an empty file, not a real
+        // database: the Codex adapter's backup step fails-closed and
+        // reports `Failed` — proving the dispatch reached the real
+        // adapter override (Phase 7 commit 5) rather than the trait's
+        // default "not supported" stub.
         assert_eq!(
             results[0].outcome,
             CleanupOutcome::Failed,
-            "default ProviderOperation impl must report Failed (Codex overrides in commit 5)"
+            "bogus fixture DB must fail the Codex provider operation"
         );
         assert_eq!(results[0].reclaimed_bytes, 0);
         assert!(
-            results[0]
+            !results[0]
                 .reason
                 .as_deref()
                 .unwrap_or("")
                 .contains("not supported"),
-            "reason must point at the default impl's message"
+            "reason must come from the Codex override, not the trait default stub"
         );
 
-        // Cleanup fake HOME.
+        // Cleanup fake HOME + PATH.
         match previous_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+        match previous_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
         std::fs::remove_dir_all(&audit_root).ok();
+        std::fs::remove_dir_all(&empty_path).ok();
     }
 }

@@ -64,6 +64,7 @@ dependencies = [
  "async-trait",
  "rusqlite",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -127,8 +128,10 @@ dependencies = [
  "agenttidy-provider-api",
  "anyhow",
  "async-trait",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

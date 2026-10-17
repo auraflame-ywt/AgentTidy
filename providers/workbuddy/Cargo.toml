@@ -14,3 +14,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Tests construct a minimal workbuddy.db (sessions v1 contract) to
+# exercise the lifecycle-inference and cleanup-unit paths.
+rusqlite = { workspace = true }
+tokio = { workspace = true }

@@ -38,20 +38,44 @@ pub enum TrashOutcome {
     Removed,
     /// The path was already gone when we tried. Idempotency guard.
     AlreadyGone,
-    /// The platform refused the operation (file locked by another
-    /// process, headless macOS session with no Finder service, …).
-    /// The verbatim platform error is preserved for diagnostics and
-    /// the audit log; distinguishing locked vs. denied by string match
-    /// is fragile and is deferred to Phase 7 hardening.
+    /// The path is held open by another process (Windows
+    /// `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`, including
+    /// their HRESULT forms). This is a *transient* condition: the
+    /// caller reports `skipped` with a retry hint, never `failed`
+    /// (`docs/safety/session-transcript-fileset.md` Concurrency).
+    Locked,
+    /// The platform refused the operation for any other reason
+    /// (headless macOS session with no Finder service, …). The
+    /// verbatim platform error is preserved for diagnostics and
+    /// the audit log.
     PlatformError(String),
+}
+
+/// Windows error codes (and their `HRESULT_FROM_WIN32` forms) that mean
+/// "another process holds this file open" — the only lock signals the
+/// trash layer can reliably classify (`docs/safety/README.md`, Phase 7
+/// hardening item "skipped vs failed for locked files").
+const LOCK_ERROR_CODES: [i32; 4] = [
+    32,                    // ERROR_SHARING_VIOLATION
+    33,                    // ERROR_LOCK_VIOLATION
+    0x8007_0020u32 as i32, // HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION)
+    0x8007_0021u32 as i32, // HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION)
+];
+
+/// Classify a `trash` crate error as the lock signal when its OS
+/// error code is one of the lock codes. Non-Windows platforms never
+/// produce these codes, so the check is harmless everywhere.
+fn is_locked_error(error: &trash::Error) -> bool {
+    matches!(error, trash::Error::Os { code, .. } if LOCK_ERROR_CODES.contains(code))
 }
 
 /// Move `path` to the OS trash. Works for files and directories.
 ///
 /// Fail-closed semantics: any doubt (missing path, locked file,
 /// platform error) maps to a `TrashOutcome` variant — never to a
-/// silent success. Callers map `PlatformError` to a `CleanupOutcome::Failed`
-/// or `Skipped` per `Start.md` §16.2 + §12.3.
+/// silent success. Callers map `Locked` to `CleanupOutcome::Skipped`
+/// (transient, retry after the holder exits), `PlatformError` to
+/// `CleanupOutcome::Failed` per `Start.md` §16.2 + §12.3.
 pub fn move_to_trash(path: &Path) -> Result<TrashOutcome, TrashError> {
     if path.symlink_metadata().is_err() {
         // symlink_metadata: a broken symlink still counts as present
@@ -60,6 +84,7 @@ pub fn move_to_trash(path: &Path) -> Result<TrashOutcome, TrashError> {
     }
     match trash::delete(path) {
         Ok(()) => Ok(TrashOutcome::Removed),
+        Err(error) if is_locked_error(&error) => Ok(TrashOutcome::Locked),
         Err(error) => Ok(TrashOutcome::PlatformError(error.to_string())),
     }
 }
@@ -117,6 +142,13 @@ mod tests {
                 // callers so cleanup remains fail-closed.
                 eprintln!("skipping native-trash assertion: {error}");
             }
+            Ok(TrashOutcome::Locked) => {
+                // A freshly-written temp file is not held by anyone; if the
+                // platform nonetheless reports a lock, treat it as the
+                // environment limitation above (the classifier is what the
+                // dedicated test below pins).
+                eprintln!("unexpected lock classification on an unheld temp file");
+            }
             Err(error) => panic!("existing temporary file must be trappable: {error}"),
         }
 
@@ -133,6 +165,34 @@ mod tests {
             move_to_trash(&missing),
             Err(TrashError::NotFound(_))
         ));
+    }
+
+    /// The lock classifier recognizes the Windows sharing/lock violation
+    /// codes (raw and HRESULT forms) and nothing else. This is the
+    /// `skipped`-vs-`failed` contract from
+    /// `docs/safety/session-transcript-fileset.md` (Concurrency).
+    #[test]
+    fn locked_error_codes_classify_as_locked() {
+        for code in [32, 33, 0x8007_0020u32 as i32, 0x8007_0021u32 as i32] {
+            let error = trash::Error::Os {
+                code,
+                description: "the process cannot access the file".into(),
+            };
+            assert!(
+                is_locked_error(&error),
+                "code {code} must classify as locked"
+            );
+        }
+        // Ordinary OS errors are not locks.
+        let not_locked = trash::Error::Os {
+            code: 5, // ERROR_ACCESS_DENIED
+            description: "access denied".into(),
+        };
+        assert!(!is_locked_error(&not_locked));
+        let unknown = trash::Error::Unknown {
+            description: "unclassified".into(),
+        };
+        assert!(!is_locked_error(&unknown));
     }
 
     #[test]

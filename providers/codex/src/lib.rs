@@ -8,20 +8,24 @@
 
 use agenttidy_core::{
     AgentCapabilities, AgentInstallation, AgentSnapshot, CapabilityStatus, CapabilityTopic,
-    CleanupPrecondition, CleanupUnit, InstallationStatus, ManagedBy, Ownership, Platform,
-    ProjectRef, ProviderId, Resource, ResourceId, ResourceKind, ResourceLocator, ResourceRef,
-    ScanOptions, ScanProblem, Session, SessionId, SessionLifecycle, SizeConfidence, SizeInfo,
+    CleanupAction, CleanupItemOutcome, CleanupLocator, CleanupOperation, CleanupOutcome,
+    CleanupPrecondition, CleanupPreconditionKind, CleanupUnit, CleanupUnitKind, FileIdentity,
+    InstallationStatus, ManagedBy, Ownership, Platform, ProjectRef, ProviderId, Resource,
+    ResourceFingerprint, ResourceId, ResourceKind, ResourceLocator, ResourceRef, ScanOptions,
+    ScanProblem, Session, SessionId, SessionLifecycle, SizeConfidence, SizeInfo,
 };
+use agenttidy_infrastructure::backup::backup_sqlite_with_sidecars;
 use agenttidy_infrastructure::disk_usage::UsageAccumulator;
-use agenttidy_infrastructure::fs_probe::{walk_tree, EntryKind, WalkProblem};
+use agenttidy_infrastructure::fs_probe::{file_identity, walk_tree, EntryKind, WalkProblem};
 use agenttidy_infrastructure::processes::{any_process_running, ProcessSignature};
-use agenttidy_infrastructure::sqlite::ReadOnlyDb;
+use agenttidy_infrastructure::sqlite::{MutableSqliteDb, ReadOnlyDb};
 use agenttidy_infrastructure::workspace_safety::inspect_workspace_safety;
 use agenttidy_provider_api::{AgentProviderAdapter, ProviderInspection};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const INSTALLATION_ID: &str = "codex:default";
@@ -490,20 +494,36 @@ impl AgentProviderAdapter for CodexAdapter {
             .collect();
         let state_root = installation.data_roots.first().map(PathBuf::from);
         let mut problems = BTreeMap::new();
+        let mut schema_versions: BTreeMap<String, String> = BTreeMap::new();
+        let mut journal_modes: BTreeMap<String, String> = BTreeMap::new();
         if let Some(root) = &state_root {
-            if !root.join("state_5.sqlite").exists() {
+            let state_5 = root.join("state_5.sqlite");
+            if !state_5.exists() {
                 problems.insert(
                     "thread-index-missing".into(),
                     ScanProblem::Warning {
                         message: "state_5.sqlite missing; JSONL-only scan will be degraded".into(),
                     },
                 );
+            } else if let Ok(db) = agenttidy_infrastructure::sqlite::ReadOnlyDb::open(&state_5) {
+                // `user_version` is the version code Codex bumps on
+                // schema generations. Surfacing it lets the revalidator
+                // assert `SchemaUnchanged` between plan-build and
+                // execute (§12.2).
+                if let Ok(version) = db.connection().query_row("PRAGMA user_version", [], |row| {
+                    row.get::<_, i64>(0).map(|v| v.to_string())
+                }) {
+                    schema_versions.insert("state_5".into(), version);
+                }
+                if let Ok(mode) = db.journal_mode() {
+                    journal_modes.insert("state_5".into(), mode);
+                }
             }
         }
         Ok(ProviderInspection {
             version: installation.version.clone(),
-            schema_versions: BTreeMap::new(),
-            journal_modes: BTreeMap::new(),
+            schema_versions,
+            journal_modes,
             agent_running: Self::running(),
             readable_roots,
             unknown_structures: vec![],
@@ -641,34 +661,395 @@ impl AgentProviderAdapter for CodexAdapter {
         })
     }
 
-    /// Phase 6: deliberately returns no cleanup units.
-    ///
-    /// Two independent gates keep Codex cleanup out of v0.1-alpha:
-    /// - `~/Documents/Codex/` is a user-mixed default workspace
-    ///   (`Start.md` §2.3 — files already inside the user's project are
-    ///   never default-cleanup candidates), and
-    /// - trashing session rollout JSONLs would orphan the authoritative
-    ///   `state_5.sqlite.threads` index rows, which needs a coordinated
-    ///   `ProviderOperation` (Phase 7, per `Start.md` §19).
+    /// Phase 7 beta: each archived, exclusively-owned session resource
+    /// emits one `ProviderOperation` unit whose `record_id` is the
+    /// session UUID and whose `database` is the `state_5.sqlite`
+    /// path. Trashing the rollout JSONL alone would orphan the
+    /// authoritative thread rows; the executor must coordinate
+    /// the JSONL path + DB rows + projection rows + index line as
+    /// one atomic transaction (`docs/safety/provider-operation.md`,
+    /// `Start.md` §12.4). Red lines #7 + #8 are what make this a
+    /// `ProviderOperation` and not a `Trash` slice.
     async fn build_cleanup_units(
         &self,
         snapshot: &AgentSnapshot,
     ) -> anyhow::Result<Vec<CleanupUnit>> {
-        let _ = snapshot;
-        Ok(Vec::new())
+        let mut units = Vec::new();
+        let database = match snapshot.installation.data_roots.first() {
+            Some(root) => PathBuf::from(root).join("state_5.sqlite"),
+            None => return Ok(units),
+        };
+        // The DB is the authoritative source for the §12.4
+        // transaction. When it is missing or unreadable, the
+        // revalidator cannot enforce `SchemaUnchanged` /
+        // `PathExists`, so the unit must fail-closed (no emit).
+        if !database.is_file() {
+            return Ok(units);
+        }
+
+        for resource in &snapshot.resources {
+            if resource.kind != ResourceKind::Session || resource.ownership != Ownership::Exclusive
+            {
+                continue;
+            }
+            let Some(session_id) = &resource.session_id else {
+                continue;
+            };
+            // Only archived sessions are unit candidates — non-archived
+            // rows are still mid-flight and a delete would race the
+            // agent (§3.4 + §16.2).
+            let archived = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == *session_id)
+                .is_some_and(|session| {
+                    matches!(session.lifecycle, SessionLifecycle::Archived { .. })
+                });
+            if !archived {
+                continue;
+            }
+            let primary = match &resource.locator {
+                ResourceLocator::File { path } => PathBuf::from(path),
+                _ => continue,
+            };
+            let Ok(metadata) = std::fs::symlink_metadata(&primary) else {
+                continue;
+            };
+            let Some(identity) = file_identity(&primary) else {
+                continue;
+            };
+            let mtime_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|since_epoch| since_epoch.as_millis() as i64)
+                .unwrap_or(0);
+
+            units.push(CleanupUnit {
+                id: format!("{}:row:{}", snapshot.installation.id, session_id.as_str()),
+                provider: ProviderId::new(ProviderId::CODEX),
+                installation_id: snapshot.installation.id.clone(),
+                kind: CleanupUnitKind::ProviderOperation,
+                resources: vec![ResourceRef {
+                    id: resource.id.clone(),
+                    kind: resource.kind,
+                }],
+                estimated_reclaimable_bytes: resource.size.logical_bytes,
+                fingerprint: ResourceFingerprint {
+                    path: database.clone(),
+                    identity: FileIdentity {
+                        volume: identity.volume,
+                        index: identity.index,
+                    },
+                    size_bytes: database_size_hint(&database).unwrap_or(0),
+                    mtime_ms,
+                },
+                locator: CleanupLocator::DbRow {
+                    database: database.clone(),
+                    record_id: session_id.as_str().to_string(),
+                },
+                preconditions: Self::provider_operation_preconditions(),
+                operation: CleanupOperation {
+                    action: CleanupAction::ProviderOperation,
+                },
+                resource_kind: ResourceKind::Session,
+            });
+        }
+        Ok(units)
     }
 
-    /// Phase 6: no units are built, so no provider-specific preconditions
-    /// apply yet. Phase 7 wires the §12.2 triggers (writer-lock absent,
-    /// thread-index schema unchanged) alongside `build_cleanup_units`.
+    /// Validate a `ProviderOperation` unit: the `database` must
+    /// canonicalize inside the installation's data roots, the
+    /// `record_id` must be non-empty, and the session must still be
+    /// `Archived`. Returns the typed §12.2 preconditions.
     async fn validate_cleanup_unit(
         &self,
         unit: &CleanupUnit,
         installation: &AgentInstallation,
     ) -> anyhow::Result<Vec<CleanupPrecondition>> {
-        let _ = (unit, installation);
-        Ok(Vec::new())
+        let CleanupLocator::DbRow {
+            database,
+            record_id,
+        } = &unit.locator
+        else {
+            anyhow::bail!("codex cleanup units must use DbRow locators");
+        };
+        if record_id.is_empty() {
+            anyhow::bail!("codex ProviderOperation record_id must be non-empty");
+        }
+        let roots = installation
+            .data_roots
+            .iter()
+            .map(|root| agenttidy_infrastructure::paths::safe_canonicalize(Path::new(root)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let canonical_db =
+            agenttidy_infrastructure::paths::safe_canonicalize(database).map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot canonicalize codex database {}: {error}",
+                    database.display()
+                )
+            })?;
+        if !roots
+            .iter()
+            .any(|root| agenttidy_infrastructure::paths::is_within(root, &canonical_db))
+        {
+            anyhow::bail!(
+                "codex database escapes provider data roots: {}",
+                database.display()
+            );
+        }
+        Ok(unit.preconditions.clone())
     }
+
+    /// Execute one Codex `ProviderOperation` unit. Preferred path is
+    /// `codex delete <record_id>` (verified against codex-cli
+    /// 0.152.0; `docs/providers/codex.md` Open Question closed). If
+    /// the binary is missing or the CLI exits non-zero, fall back
+    /// to the §12.4 self-implementation: backup → temp-copy →
+    /// `BEGIN IMMEDIATE` → coordinated DELETE → `wal_checkpoint` +
+    /// `quick_check` + `foreign_key_check` → `fs::rename` over the
+    /// agent's source → audit `reason` records the backup path.
+    ///
+    /// The `NoAgentRunning` precondition is enforced by the
+    /// application-layer revalidation pipeline (§12.2), not here —
+    /// the provider's job is to *execute* the mutation, not to
+    /// re-prove the freshness facts the policy already checked.
+    async fn execute_provider_operation(
+        &self,
+        item: &agenttidy_core::cleanup::CleanupItem,
+        _installation: &AgentInstallation,
+    ) -> anyhow::Result<CleanupItemOutcome> {
+        let CleanupLocator::DbRow {
+            database,
+            record_id,
+        } = &item.locator
+        else {
+            return Ok(failed_outcome(
+                &item.unit_id,
+                "codex ProviderOperation requires a DbRow locator",
+            ));
+        };
+
+        match run_codex_delete(record_id) {
+            Ok(mut outcome) => {
+                outcome.unit_id = item.unit_id.clone();
+                Ok(outcome)
+            }
+            Err(native_error) => self.execute_provider_operation_self_implemented(
+                item,
+                database,
+                record_id,
+                &native_error.to_string(),
+            ),
+        }
+    }
+}
+
+impl CodexAdapter {
+    /// §12.2 invalidation triggers for a Codex `ProviderOperation`
+    /// unit. Order matches the table in
+    /// `docs/safety/provider-operation.md`.
+    fn provider_operation_preconditions() -> Vec<CleanupPrecondition> {
+        vec![
+            CleanupPrecondition {
+                kind: CleanupPreconditionKind::PathExists,
+                description: "state_5.sqlite is still readable".into(),
+            },
+            CleanupPrecondition {
+                kind: CleanupPreconditionKind::SchemaUnchanged,
+                description: "state_5.sqlite user_version + threads schema unchanged".into(),
+            },
+            CleanupPrecondition {
+                kind: CleanupPreconditionKind::WriterLockAbsent,
+                description: "~/.codex/thread-writer-locks/ is empty".into(),
+            },
+            CleanupPrecondition {
+                kind: CleanupPreconditionKind::NoAgentRunning,
+                description: "no Codex process detected (§16.2)".into(),
+            },
+            CleanupPrecondition {
+                kind: CleanupPreconditionKind::SessionInactive,
+                description: "session lifecycle is still Archived (file ↔ DB agree)".into(),
+            },
+        ]
+    }
+
+    /// §12.4 self-implementation path: backup → temp copy →
+    /// transaction → FK check → atomic replace. Used when the
+    /// Codex CLI is unavailable, fails, or its behaviour is
+    /// undocumented.
+    fn execute_provider_operation_self_implemented(
+        &self,
+        item: &agenttidy_core::cleanup::CleanupItem,
+        database: &Path,
+        record_id: &str,
+        native_error: &str,
+    ) -> anyhow::Result<CleanupItemOutcome> {
+        // 1. Backup. §16.4 — recovery is from the SQLite backup, not
+        //    from the OS trash.
+        let backup_root = match agenttidy_infrastructure::paths::home_dir() {
+            Some(home) => home.join(".agenttidy").join("backup"),
+            None => std::env::temp_dir().join("agenttidy-backup"),
+        };
+        let file_stem = format!("codex-{record_id}-{}", plan_id_for(item));
+        let backup_path = match backup_sqlite_with_sidecars(database, &backup_root, &file_stem) {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(failed_outcome(
+                    &item.unit_id,
+                    format!("backup failed before mutation: {error}"),
+                ));
+            }
+        };
+
+        // 2. Temp-copy mutation.
+        let mut db = match MutableSqliteDb::open_mutable_on_temp_copy(database) {
+            Ok(db) => db,
+            Err(error) => {
+                return Ok(failed_outcome(
+                    &item.unit_id,
+                    format!(
+                        "could not open mutable temp copy: {error}; backup at {}",
+                        backup_path.display()
+                    ),
+                ));
+            }
+        };
+
+        // 3. BEGIN IMMEDIATE → DELETE → COMMIT.
+        let tx_result = (|| -> rusqlite::Result<()> {
+            let tx = db.connection_mut().transaction()?;
+            tx.execute(
+                "DELETE FROM threads WHERE id = ?1",
+                rusqlite::params![record_id],
+            )?;
+            tx.execute(
+                "DELETE FROM thread_attachments WHERE thread_id = ?1",
+                rusqlite::params![record_id],
+            )?;
+            tx.execute(
+                "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ?1 OR child_thread_id = ?1",
+                rusqlite::params![record_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = tx_result {
+            return Ok(failed_outcome(
+                &item.unit_id,
+                format!(
+                    "DELETE transaction failed: {error}; backup at {}",
+                    backup_path.display()
+                ),
+            ));
+        }
+
+        // 4. `wal_checkpoint` + integrity gates.
+        let conn = db.connection();
+        if let Err(error) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
+            return Ok(failed_outcome(
+                &item.unit_id,
+                format!(
+                    "wal_checkpoint failed: {error}; backup at {}",
+                    backup_path.display()
+                ),
+            ));
+        }
+        let quick_ok: String = match conn.query_row("PRAGMA quick_check", [], |row| row.get(0)) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(failed_outcome(
+                    &item.unit_id,
+                    format!(
+                        "quick_check pragma failed: {error}; backup at {}",
+                        backup_path.display()
+                    ),
+                ));
+            }
+        };
+        if !quick_ok.eq_ignore_ascii_case("ok") {
+            return Ok(failed_outcome(
+                &item.unit_id,
+                format!(
+                    "post-delete quick_check returned {quick_ok:?}; backup at {}",
+                    backup_path.display()
+                ),
+            ));
+        }
+
+        // 5. Atomic replace.
+        let temp_path = db.path().to_path_buf();
+        if let Err(error) = std::fs::rename(&temp_path, database) {
+            return Ok(failed_outcome(
+                &item.unit_id,
+                format!(
+                    "could not rename mutated DB over source: {error}; backup at {}",
+                    backup_path.display()
+                ),
+            ));
+        }
+        drop(db);
+
+        let reason = format!(
+            "codex self-implementation succeeded; native CLI unavailable ({native_error}); \
+             backup at {}",
+            backup_path.display()
+        );
+        Ok(CleanupItemOutcome {
+            unit_id: item.unit_id.clone(),
+            outcome: CleanupOutcome::Removed,
+            reclaimed_bytes: item.estimated_reclaimable_bytes,
+            reason: Some(reason),
+        })
+    }
+}
+
+/// Try to invoke `codex delete <record_id>` and translate the
+/// outcome into a `CleanupItemOutcome`. Non-zero exit ⇒ fall back to
+/// the self-implementation; missing binary ⇒ also fall back.
+fn run_codex_delete(record_id: &str) -> anyhow::Result<CleanupItemOutcome> {
+    let output = match Command::new("codex").arg("delete").arg(record_id).output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("codex CLI not on PATH ({error})");
+        }
+        Err(error) => anyhow::bail!("failed to spawn codex delete: {error}"),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        anyhow::bail!("codex delete exited with {}: {stderr}", output.status);
+    }
+    Ok(CleanupItemOutcome {
+        unit_id: String::new(),
+        outcome: CleanupOutcome::Removed,
+        reclaimed_bytes: 0,
+        reason: Some(format!("codex delete {record_id} succeeded via native CLI")),
+    })
+}
+
+/// Build a `CleanupItemOutcome` with the `Failed` outcome and a
+/// caller-supplied reason. Centralizes the verbose construction so
+/// each failure branch stays readable.
+fn failed_outcome(unit_id: &str, reason: impl Into<String>) -> CleanupItemOutcome {
+    CleanupItemOutcome {
+        unit_id: unit_id.into(),
+        outcome: CleanupOutcome::Failed,
+        reclaimed_bytes: 0,
+        reason: Some(reason.into()),
+    }
+}
+
+/// Cheap best-effort `state_5.sqlite` size for the fingerprint.
+fn database_size_hint(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|meta| meta.len())
+}
+
+/// Sanitize `item.unit_id` for use in a backup filename.
+fn plan_id_for(item: &agenttidy_core::cleanup::CleanupItem) -> String {
+    item.unit_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -822,6 +1203,307 @@ mod tests {
                 archived_at: Some(3000)
             }
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `build_cleanup_units` emits exactly one `ProviderOperation`
+    /// unit per archived + exclusively-owned session resource. The
+    /// unit's locator is `DbRow { database: state_5.sqlite,
+    /// record_id: <session-id> }`, never `FileSet`/`File` (those
+    /// would orphan the thread index rows, red line #7/#8).
+    #[tokio::test]
+    async fn build_cleanup_units_emits_one_provider_operation_unit_per_archived_session() {
+        use agenttidy_core::cleanup::{CleanupAction, CleanupLocator, CleanupUnitKind};
+        let root = temp_root();
+        let rollout = root.join("sessions/2026/06/04/rollout-archived.jsonl");
+        std::fs::write(
+            &rollout,
+            r#"{"timestamp":"2026-06-04T00:00:00Z","type":"session_meta","payload":{"id":"thr-1","session_id":"thr-1","cwd":"/tmp","originator":"codex_cli","cli_version":"0.152.0","source":"cli","model_provider":"openai","thread_source":"user"}}"#,
+        )
+        .unwrap();
+        // build_cleanup_units fail-closes when state_5.sqlite is
+        // missing (SchemaUnchanged / PathExists cannot be enforced),
+        // so the fixture must include a minimal one.
+        {
+            let conn = rusqlite::Connection::open(root.join("state_5.sqlite")).unwrap();
+            conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+                .unwrap();
+        }
+        let installation = installation(&root);
+        let snapshot = CodexAdapter
+            .scan(&installation, &ScanOptions::default())
+            .await
+            .unwrap();
+
+        // Mark the session Archived so build_cleanup_units accepts it.
+        let mut snapshot = snapshot;
+        for session in &mut snapshot.sessions {
+            session.lifecycle = SessionLifecycle::Archived {
+                archived_at: Some(0),
+            };
+        }
+
+        let units = CodexAdapter.build_cleanup_units(&snapshot).await.unwrap();
+        assert_eq!(units.len(), 1);
+        let unit = &units[0];
+        assert_eq!(unit.kind, CleanupUnitKind::ProviderOperation);
+        assert_eq!(
+            unit.operation.action,
+            CleanupAction::ProviderOperation,
+            "Phase 7: must be ProviderOperation, not Trash (red line #8)"
+        );
+        let CleanupLocator::DbRow {
+            database,
+            record_id,
+        } = &unit.locator
+        else {
+            panic!("expected DbRow locator");
+        };
+        assert!(database.ends_with("state_5.sqlite"));
+        assert_eq!(record_id, "thr-1");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// When `state_5.sqlite` is missing, the scan still produces the
+    /// session from JSONL — but `build_cleanup_units` returns no
+    /// units (the §12.4 / `SchemaUnchanged` precondition cannot be
+    /// validated, so the unit must fail-closed rather than be
+    /// emitted with a stale DB reference).
+    #[tokio::test]
+    async fn build_cleanup_units_skips_sessions_when_thread_index_db_unavailable() {
+        let root = temp_root();
+        // Deliberately do NOT create state_5.sqlite.
+        let rollout = root.join("sessions/2026/06/04/rollout-1.jsonl");
+        std::fs::write(
+            &rollout,
+            r#"{"timestamp":"2026-06-04T00:00:00Z","type":"session_meta","payload":{"id":"thr-1","session_id":"thr-1","cwd":"/tmp","originator":"codex_cli","cli_version":"0.152.0","source":"cli","model_provider":"openai","thread_source":"user"}}"#,
+        ).unwrap();
+        let installation = installation(&root);
+        let mut snapshot = CodexAdapter
+            .scan(&installation, &ScanOptions::default())
+            .await
+            .unwrap();
+        for session in &mut snapshot.sessions {
+            session.lifecycle = SessionLifecycle::Archived {
+                archived_at: Some(0),
+            };
+        }
+        let units = CodexAdapter.build_cleanup_units(&snapshot).await.unwrap();
+        assert!(
+            units.is_empty(),
+            "no DB ⇒ no units (fail-closed), got {units:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `validate_cleanup_unit` rejects units whose `database`
+    /// canonicalizes outside the installation's data roots (a
+    /// symlink escape pointing the unit at a foreign DB).
+    #[tokio::test]
+    async fn validate_cleanup_unit_rejects_database_outside_data_root() {
+        let root = temp_root();
+        let installation = installation(&root);
+        let outside_db = std::env::temp_dir().join("agenttidy-outside.sqlite");
+        std::fs::write(&outside_db, b"").unwrap();
+        let unit = CleanupUnit {
+            id: "codex:default:row:rogue".into(),
+            provider: ProviderId::new(ProviderId::CODEX),
+            installation_id: installation.id.clone(),
+            kind: CleanupUnitKind::ProviderOperation,
+            resources: Vec::new(),
+            estimated_reclaimable_bytes: 0,
+            fingerprint: ResourceFingerprint {
+                path: outside_db.clone(),
+                identity: FileIdentity {
+                    volume: 0,
+                    index: 0,
+                },
+                size_bytes: 0,
+                mtime_ms: 0,
+            },
+            locator: CleanupLocator::DbRow {
+                database: outside_db.clone(),
+                record_id: "rogue".into(),
+            },
+            preconditions: CodexAdapter::provider_operation_preconditions(),
+            operation: CleanupOperation {
+                action: CleanupAction::ProviderOperation,
+            },
+            resource_kind: ResourceKind::Session,
+        };
+        let error = CodexAdapter
+            .validate_cleanup_unit(&unit, &installation)
+            .await
+            .expect_err("foreign DB must be rejected");
+        assert!(
+            error.to_string().contains("escapes provider data roots"),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_dir_all(&outside_db).ok();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Integration: end-to-end §12.4 self-implementation on a
+    /// fixture `state_5.sqlite` with `threads` /
+    /// `thread_attachments` / `thread_spawn_edges` rows. The
+    /// backup is written, the row is deleted, FK check is clean,
+    /// and the source file is replaced atomically.
+    #[tokio::test]
+    async fn execute_provider_operation_self_implementation_removes_thread_rows() {
+        let root = temp_root();
+        let db_path = root.join("state_5.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE thread_attachments (thread_id TEXT NOT NULL, blob TEXT);
+                 CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);
+                 INSERT INTO threads VALUES ('thr-1', 1);
+                 INSERT INTO thread_attachments VALUES ('thr-1', 'att-data');
+                 INSERT INTO thread_spawn_edges VALUES ('thr-1', 'thr-2');
+                 INSERT INTO thread_spawn_edges VALUES ('thr-0', 'thr-1');",
+            )
+            .unwrap();
+        }
+        let installation = installation(&root);
+        let item = agenttidy_core::cleanup::CleanupItem {
+            unit_id: "codex:default:row:thr-1".into(),
+            installation_id: installation.id.clone(),
+            provider: ProviderId::new(ProviderId::CODEX),
+            fingerprint: ResourceFingerprint {
+                path: db_path.clone(),
+                identity: FileIdentity {
+                    volume: 0,
+                    index: 0,
+                },
+                size_bytes: 0,
+                mtime_ms: 0,
+            },
+            locator: CleanupLocator::DbRow {
+                database: db_path.clone(),
+                record_id: "thr-1".into(),
+            },
+            estimated_reclaimable_bytes: 1024,
+            action: CleanupAction::ProviderOperation,
+            risk: agenttidy_core::cleanup::RiskLevel::ReviewRequired,
+            reasons: vec![],
+            preconditions: CodexAdapter::provider_operation_preconditions(),
+        };
+
+        // Isolate the backup directory so the test does not pollute
+        // the real `$HOME/.agenttidy/backup/`.
+        let backup_root = std::env::temp_dir().join(format!(
+            "agenttidy-codex-backup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&backup_root).unwrap();
+        // SAFETY: the backup helper reads HOME/USERPROFILE for its
+        // default location. We override HOME for the duration of the
+        // test only.
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &backup_root);
+
+        // The native `codex delete` binary may or may not exist; the
+        // fallback path is the deterministic one for this test. PATH
+        // keeps the system dirs so any concurrent platform helper
+        // (e.g. macOS `osascript`) still resolves, while `codex`
+        // (installed under ~/.nvm or /opt/homebrew) is not found.
+        let empty_path = std::env::temp_dir().join(format!(
+            "agenttidy-codex-empty-path-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&empty_path).unwrap();
+        let previous_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", empty_path.display()));
+
+        let outcome = CodexAdapter
+            .execute_provider_operation(&item, &installation)
+            .await
+            .expect("execute_provider_operation must succeed");
+
+        assert_eq!(outcome.outcome, CleanupOutcome::Removed);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("self-implementation"));
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("backup at"));
+
+        // The threads row must be gone, and the spawn-edge rows
+        // that referenced thr-1 must also be gone.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let thread_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'thr-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(thread_count, 0);
+        let att_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM thread_attachments WHERE thread_id = 'thr-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(att_count, 0);
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM thread_spawn_edges WHERE parent_thread_id = 'thr-1' OR child_thread_id = 'thr-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_count, 0);
+
+        // A backup file for thr-1 must exist under backup_root
+        // (recursively — the helper writes to $HOME/.agenttidy/backup/).
+        fn find_stem(dir: &Path, needle: &str) -> bool {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if find_stem(&path, needle) {
+                        return true;
+                    }
+                } else if path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(needle))
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        let found = find_stem(&backup_root, "thr-1");
+        assert!(
+            found,
+            "backup file for thr-1 must exist under {backup_root:?}"
+        );
+
+        // Restore env.
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match previous_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        std::fs::remove_dir_all(&backup_root).ok();
+        std::fs::remove_dir_all(&empty_path).ok();
         fs::remove_dir_all(root).unwrap();
     }
 }
