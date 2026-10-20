@@ -1,3 +1,11 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Shared keyboard affordances across the inspection flow (Start.md §6).
+   Keep controls visible without introducing animation into confirmation. */
+@layer base {
+  body { @apply antialiased; }
+  :focus-visible { outline: 2px solid #059669; outline-offset: 3px; }
+  button:disabled { cursor: not-allowed; }
+}

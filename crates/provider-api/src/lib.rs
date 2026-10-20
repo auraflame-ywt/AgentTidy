@@ -292,6 +292,7 @@ mod tests {
         }
 
         let item = CleanupItem {
+            evidence: Default::default(),
             unit_id: "stub:row:1".into(),
             installation_id: "stub".into(),
             provider: ProviderId::new("stub"),

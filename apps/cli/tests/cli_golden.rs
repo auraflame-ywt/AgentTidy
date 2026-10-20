@@ -129,6 +129,9 @@ fn run_cli(command: &str, home: &Path) -> CliOutput {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("LOCALAPPDATA", home)
+        // Never run the developer's installed CLI during fixture snapshots.
+        // The missing-binary diagnostic is stable across local/CI machines.
+        .env("PATH", home.join("empty-bin"))
         .output()
         .expect("spawn agenttidy binary");
     CliOutput {

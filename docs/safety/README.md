@@ -13,4 +13,4 @@ its cleanup is enabled. Current status:
 | --- | --- |
 | Default workspaces (`file-tree`) | Documented; **not enabled** (Phase 6 framework only, enablement deferred — see the doc's status note). |
 | Session transcripts (`file-set`) | Documented in [`session-transcript-fileset.md`](./session-transcript-fileset.md); **enabled (Phase 7 beta)** for the Claude Code provider. Documented in [`workbuddy-session-fileset.md`](./workbuddy-session-fileset.md); **enabled (Phase 7 beta)** for the WorkBuddy provider. |
-| Provider DB records (`provider-operation`) | Documented in [`provider-operation.md`](./provider-operation.md); **enabled (Phase 7 beta)** for the Codex provider's archived sessions only. |
+| Provider DB records (`provider-operation`) | Documented in [`provider-operation.md`](./provider-operation.md); **Blocked pending complete recovery acceptance** for Codex archived sessions (CLI admission diagnosed early; native deletion and DB replacement disabled). |

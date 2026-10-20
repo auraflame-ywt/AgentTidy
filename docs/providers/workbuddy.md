@@ -224,3 +224,15 @@ Root: `%USERPROFILE%\.workbuddy\` (e.g. `C:\Users\18712\.workbuddy\`). App insta
 - [ ] Blob GC: are `blobs/` entries ever unreferenced? Needs write-path study.
 - [ ] Confirm the full set of per-session sidecar filename patterns (`<uuid>.meta.json`, `<uuid>.file-rollback.ndjson` observed — are there more?).
 - [ ] Is the default workspace root configurable in-app (registry/setting)? If so, discovery must read the config, not assume `%USERPROFILE%\WorkBuddy\`.
+
+
+## 本机 Mac 补充核对（2026-10-20）
+
+WorkBuddy 5.8.3 的应用包 `Info.plist` 报告 `CFBundleExecutable=Electron`。
+仅匹配进程名 WorkBuddy 会漏报活跃应用；进程探针现同时匹配 executable / cmd
+中的 `WorkBuddy.app/Contents/`。本机 doctor 已由误报 not-running 修正为 running，
+因此应用打开期间清理保持 Blocked。此核对不依赖会话正文或凭证。
+
+本机 sessions 表保留 v1 读取列并增加其他列；当前兼容检查针对所需列的子集，
+不要求整表恰好只有 12 列。此次只读扫描得到 309 个可识别会话；真实文件集清理
+尚未执行。详见 [`../testing/macos-scenarios.md`](../testing/macos-scenarios.md)。

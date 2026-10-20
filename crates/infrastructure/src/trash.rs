@@ -77,15 +77,40 @@ fn is_locked_error(error: &trash::Error) -> bool {
 /// (transient, retry after the holder exits), `PlatformError` to
 /// `CleanupOutcome::Failed` per `Start.md` §16.2 + §12.3.
 pub fn move_to_trash(path: &Path) -> Result<TrashOutcome, TrashError> {
-    if path.symlink_metadata().is_err() {
-        // symlink_metadata: a broken symlink still counts as present
-        // (its link entry can be trashed); the target is irrelevant.
-        return Err(TrashError::NotFound(path.to_path_buf()));
+    match path.symlink_metadata() {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(TrashError::NotFound(path.to_path_buf()))
+        }
+        Err(error) => {
+            return Err(TrashError::Platform(format!(
+                "cannot inspect {}: {error}",
+                path.display()
+            )))
+        }
     }
-    match trash::delete(path) {
+    match native_trash(path) {
         Ok(()) => Ok(TrashOutcome::Removed),
         Err(error) if is_locked_error(&error) => Ok(TrashOutcome::Locked),
         Err(error) => Ok(TrashOutcome::PlatformError(error.to_string())),
+    }
+}
+
+/// macOS uses NSFileManager directly. Finder AppleScript requires Automation
+/// permission and a logged-in Finder service, neither of which is necessary
+/// for the OS Trash API. Recovery is manual (drag from Trash); “Put Back” is
+/// not guaranteed by this API and must not be promised (§16.4).
+fn native_trash(path: &Path) -> Result<(), trash::Error> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut context = trash::TrashContext::new();
+        context.set_delete_method(DeleteMethod::NsFileManager);
+        context.delete(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(path)
     }
 }
 

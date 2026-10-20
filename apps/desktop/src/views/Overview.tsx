@@ -1,333 +1,81 @@
-// Overview view — Start.md §6.1.
-//
-// One card per detected installation with:
-//   - installation id + provider + status badge
-//   - per-topic capability badges (read-only / degraded / …)
-//   - snapshot totals: sessions / resources / total size (with confidence)
-//   - workspace footprint (the `Workspace`-kind resources only)
-//   - a diagnostics count that links to the Diagnostics tab when > 0
-//
-// i18n: badge labels, headers and templates go through `useI18n().t`;
-// provider/platform ids and the IEC byte units come from shared helpers
-// (`format.ts` / `i18n` brand keys) so text cannot drift between views.
+// Decision-oriented storage overview (Start.md §6.1). Measured resource
+// footprint and plan estimates stay separate; neither promises freed space.
+import { humanBytes, formatDateTime } from "../format";
+import { useI18n } from "../i18n";
+import { diagnosticCount, storageSummary } from "../presentation";
+import { usePlanExpired } from "../usePlanExpired";
+import type { AgentSnapshot, CleanupPlan, DoctorReport, ProviderId } from "../types";
 
-import { humanBytes } from "../format";
-import { useI18n, type TranslationKey } from "../i18n";
-import type {
-  AgentInstallation,
-  AgentSnapshot,
-  CapabilityStatus,
-  DoctorReport,
-  InstallationStatus,
-  SizeConfidence,
-  SizeInfo,
-} from "../types";
-
-type Translate = ReturnType<typeof useI18n>["t"];
-
-function totalSize(snapshot: AgentSnapshot): SizeInfo {
-  return (
-    snapshot.resources.reduce<SizeInfo>(
-      (acc, resource) => ({
-        logical_bytes: acc.logical_bytes + resource.size.logical_bytes,
-        allocated_bytes:
-          acc.allocated_bytes != null && resource.size.allocated_bytes != null
-            ? acc.allocated_bytes + resource.size.allocated_bytes
-            : null,
-        exclusive_bytes: null,
-        shared_bytes: null,
-        reclaimable_bytes: null,
-        confidence: mergeConfidence(acc.confidence, resource.size.confidence),
-      }),
-      {
-        logical_bytes: 0,
-        allocated_bytes: 0,
-        exclusive_bytes: null,
-        shared_bytes: null,
-        reclaimable_bytes: null,
-        confidence: "exact",
-      },
-    ) ?? {
-      logical_bytes: 0,
-      allocated_bytes: null,
-      exclusive_bytes: null,
-      shared_bytes: null,
-      reclaimable_bytes: null,
-      confidence: "exact",
-    }
-  );
-}
-
-function mergeConfidence(
-  left: SizeConfidence,
-  right: SizeConfidence,
-): SizeConfidence {
-  if (left === "unknown" || right === "unknown") return "unknown";
-  if (left === "estimated" || right === "estimated") return "estimated";
-  return "exact";
-}
-
-function workspaceFootprint(snapshot: AgentSnapshot): {
-  count: number;
-  bytes: number;
-} {
-  const workspaces = snapshot.resources.filter(
-    (resource) => resource.kind === "workspace",
-  );
-  const bytes = workspaces.reduce(
-    (sum, resource) => sum + resource.size.logical_bytes,
-    0,
-  );
-  return { count: workspaces.length, bytes };
-}
-
-function statusBadge(
-  status: InstallationStatus,
-  t: Translate,
-): { label: string; className: string } {
-  switch (status) {
-    case "available":
-      return {
-        label: t("status.available"),
-        className: "bg-emerald-100 text-emerald-800",
-      };
-    case "permission-required":
-      return {
-        label: t("status.permissionRequired"),
-        className: "bg-amber-100 text-amber-800",
-      };
-    case "unsupported":
-      return {
-        label: t("status.unsupported"),
-        className: "bg-neutral-200 text-neutral-700",
-      };
-  }
-}
-
-function capabilityBadge(
-  status: CapabilityStatus | undefined,
-  t: Translate,
-): { label: string; className: string } {
-  switch (status) {
-    case undefined:
-    case "unsupported":
-      return {
-        label: t("capability.unsupported"),
-        className: "bg-neutral-100 text-neutral-500",
-      };
-    case "permission-required":
-      return {
-        label: t("capability.permissionRequired"),
-        className: "bg-amber-100 text-amber-800",
-      };
-    case "degraded":
-      return {
-        label: t("capability.degraded"),
-        className: "bg-amber-100 text-amber-800",
-      };
-    case "read-only":
-      return {
-        label: t("capability.readOnly"),
-        className: "bg-sky-100 text-sky-800",
-      };
-    case "supported":
-      return {
-        label: t("capability.supported"),
-        className: "bg-emerald-100 text-emerald-800",
-      };
-  }
-}
-
-function capabilityTopics(): Array<keyof import("../types").AgentCapabilities> {
-  return ["sessions", "projects", "archive", "cache", "logs"];
-}
-
-/** Wire-value → localized-label helpers (brand names are the same in both
- * languages; they route through the catalog so future locales can adapt). */
-function providerLabel(
-  provider: AgentInstallation["provider"],
-  t: Translate,
-): string {
-  switch (provider) {
-    case "claude-code":
-      return t("provider.claudeCode");
-    case "codex":
-      return t("provider.codex");
-    case "workbuddy":
-      return t("provider.workbuddy");
-  }
-}
-
-function platformLabel(
-  platform: AgentInstallation["platform"],
-  t: Translate,
-): string {
-  return platform === "macos" ? t("platform.macos") : t("platform.windows");
-}
-
-function confidenceLabel(
-  confidence: SizeConfidence,
-  t: Translate,
-): string {
-  switch (confidence) {
-    case "exact":
-      return t("confidence.exact");
-    case "estimated":
-      return t("confidence.estimated");
-    case "unknown":
-      return t("confidence.unknown");
-  }
-}
-
-const TOPIC_KEYS: Record<string, TranslationKey> = {
-  sessions: "topic.sessions",
-  projects: "topic.projects",
-  archive: "topic.archive",
-  cache: "topic.cache",
-  logs: "topic.logs",
-};
-
+const providerKeys = { "claude-code": "provider.claudeCode", codex: "provider.codex", workbuddy: "provider.workbuddy" } as const;
 interface OverviewProps {
-  reports: DoctorReport[];
-  snapshots: AgentSnapshot[];
-  onJumpToDiagnostics: () => void;
+  reports: DoctorReport[]; snapshots: AgentSnapshot[]; plan: CleanupPlan | null;
+  loading: boolean; onBrowse: (provider?: ProviderId) => void;
+  onReview: () => void; onJumpToDiagnostics: () => void;
 }
 
-export default function Overview({
-  reports,
-  snapshots,
-  onJumpToDiagnostics,
-}: OverviewProps) {
-  const { t } = useI18n();
-
-  if (reports.length === 0) {
-    return <p className="text-sm text-neutral-500">{t("overview.noInstallations")}</p>;
-  }
-
-  return (
-    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-      {reports.map((report) => {
-        const snapshot = snapshots.find(
-          (candidate) =>
-            candidate.installation.id === report.installation.id,
-        );
-        const status = statusBadge(report.installation.status, t);
-        const diagnosticsCount = snapshot
-          ? Object.keys(snapshot.problems).length
-          : Object.keys(report.inspection.problems).length;
-        const size = snapshot
-          ? totalSize(snapshot)
-          : {
-              logical_bytes: 0,
-              allocated_bytes: null,
-              exclusive_bytes: null,
-              shared_bytes: null,
-              reclaimable_bytes: null,
-              confidence: "exact" as const,
-            };
-        const workspace = snapshot
-          ? workspaceFootprint(snapshot)
-          : { count: 0, bytes: 0 };
-
-        return (
-          <article
-            key={report.installation.id}
-            className="flex flex-col gap-3 rounded-lg border border-neutral-200 bg-white p-4 shadow-sm"
-          >
-            <header className="flex items-baseline justify-between gap-2">
-              <div>
-                <h2 className="font-mono text-sm font-medium text-neutral-900">
-                  {report.installation.id}
-                </h2>
-                <p className="text-xs text-neutral-500">
-                  {providerLabel(report.installation.provider, t)} ·{" "}
-                  {platformLabel(report.installation.platform, t)}
-                </p>
-              </div>
-              <span
-                className={`rounded-full px-2 py-0.5 text-xs font-medium ${status.className}`}
-              >
-                {status.label}
-              </span>
-            </header>
-
-            <dl className="grid grid-cols-3 gap-3 text-xs">
-              <div>
-                <dt className="text-neutral-500">{t("overview.sessions")}</dt>
-                <dd className="text-base font-semibold text-neutral-900">
-                  {snapshot ? snapshot.sessions.length : "—"}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-neutral-500">{t("overview.resources")}</dt>
-                <dd className="text-base font-semibold text-neutral-900">
-                  {snapshot ? snapshot.resources.length : "—"}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-neutral-500">{t("overview.totalSize")}</dt>
-                <dd className="text-base font-semibold text-neutral-900">
-                  {snapshot ? humanBytes(size.logical_bytes) : "—"}
-                  {snapshot ? (
-                    <span className="ml-1 text-[10px] font-normal text-neutral-500">
-                      ({confidenceLabel(size.confidence, t)})
-                    </span>
-                  ) : null}
-                </dd>
-              </div>
-              <div className="col-span-3">
-                <dt className="text-neutral-500">
-                  {t("overview.workspaceFootprint")}
-                </dt>
-                <dd className="text-sm text-neutral-700">
-                  {snapshot
-                    ? t(
-                        workspace.count === 1
-                          ? "overview.workspaceValue.one"
-                          : "overview.workspaceValue.other",
-                        {
-                          count: workspace.count,
-                          bytes: humanBytes(workspace.bytes),
-                        },
-                      )
-                    : "—"}
-                </dd>
-              </div>
-            </dl>
-
-            <div className="flex flex-wrap gap-1">
-              {capabilityTopics().map((topic) => {
-                const badge = capabilityBadge(report.capabilities[topic], t);
-                const topicLabel = t(TOPIC_KEYS[topic]);
-                return (
-                  <span
-                    key={topic}
-                    className={`rounded-md px-2 py-0.5 text-[11px] font-medium ${badge.className}`}
-                    title={`${topicLabel}: ${badge.label}`}
-                  >
-                    {topicLabel}
-                  </span>
-                );
-              })}
-            </div>
-
-            {diagnosticsCount > 0 ? (
-              <button
-                type="button"
-                onClick={onJumpToDiagnostics}
-                className="self-start rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs font-medium text-amber-900 hover:bg-amber-100"
-              >
-                {t(
-                  diagnosticsCount === 1
-                    ? "overview.diagnostics.one"
-                    : "overview.diagnostics.other",
-                  { count: diagnosticsCount },
-                )}
-              </button>
-            ) : null}
-          </article>
-        );
-      })}
+export default function Overview({ reports, snapshots, plan, loading, onBrowse, onReview, onJumpToDiagnostics }: OverviewProps) {
+  const { t, lang } = useI18n();
+  const expired = usePlanExpired(plan);
+  const summary = storageSummary(snapshots);
+  const diagnostics = reports.reduce((sum, report) => sum + diagnosticCount(report,
+    snapshots.find(snapshot => snapshot.installation.id === report.installation.id)), 0);
+  const ranked = reports.map(report => {
+    const snapshot = snapshots.find(value => value.installation.id === report.installation.id);
+    return { report, snapshot, bytes: snapshot?.resources.reduce((sum, resource) => sum + resource.size.logical_bytes, 0) ?? 0 };
+  }).sort((a, b) => b.bytes - a.bytes);
+  const validPlan = plan && !expired ? plan : null;
+  if (loading && snapshots.length === 0) return <p role="status" className="rounded-xl border border-neutral-200 bg-white p-8 text-neutral-500">{t("common.scanning")}</p>;
+  return <div className="space-y-6">
+    <section className="rounded-2xl bg-neutral-900 p-6 text-white sm:p-8">
+      <p className="text-sm text-neutral-300">{t("home.eyebrow")}</p>
+      <div className="mt-3 flex flex-wrap items-end justify-between gap-6">
+        <div><h2 className="text-4xl font-semibold tracking-tight sm:text-5xl">{humanBytes(summary.bytes)}</h2>
+          <p className="mt-3 text-sm text-neutral-300">{t("home.scope", { agents: reports.length, sessions: summary.sessions })}{summary.estimated ? ` · ${t("confidence.estimated")}` : ""}</p></div>
+        <button type="button" onClick={() => onBrowse()} className="rounded-lg bg-white px-4 py-2.5 text-sm font-semibold text-neutral-900">{t("home.browseLargest")} →</button>
+      </div>
+      <p className="mt-6 border-t border-white/15 pt-4 text-xs leading-5 text-neutral-400">{t("home.measurement")}</p>
+    </section>
+    <div className="grid gap-4 sm:grid-cols-3">
+      <button type="button" onClick={onReview} className="rounded-xl border border-emerald-200 bg-emerald-50 p-5 text-left hover:border-emerald-400">
+        <span className="text-xs font-medium text-emerald-800">{t("home.reviewable")}</span>
+        <span className="mt-2 block text-2xl font-semibold text-emerald-950">{validPlan ? humanBytes(validPlan.total_reclaimable_bytes) : "—"}</span>
+        <span className="mt-2 block text-xs leading-5 text-emerald-800">{validPlan ? t("home.reviewHint") : t("home.previewNeeded")} →</span>
+      </button>
+      <button type="button" onClick={onReview} className="rounded-xl border border-neutral-200 bg-white p-5 text-left hover:border-neutral-400">
+        <span className="text-xs font-medium text-neutral-500">{t("home.protected")}</span>
+        <span className="mt-2 block text-2xl font-semibold">{validPlan ? validPlan.risk_summary.blocked : "—"}</span>
+        <span className="mt-2 block text-xs leading-5 text-neutral-500">{t("home.protectedHint")} →</span>
+      </button>
+      <button type="button" onClick={onJumpToDiagnostics} className="rounded-xl border border-neutral-200 bg-white p-5 text-left hover:border-neutral-400">
+        <span className="text-xs font-medium text-neutral-500">{t("home.diagnostics")}</span>
+        <span className="mt-2 block text-2xl font-semibold">{diagnostics}</span>
+        <span className="mt-2 block text-xs leading-5 text-neutral-500">{t("home.diagnosticsHint")} →</span>
+      </button>
     </div>
-  );
+    <section>
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2"><h3 className="font-semibold">{t("home.byAgent")}</h3>
+        <span role="status" className="text-xs text-neutral-500">{loading ? t("common.scanning") : summary.scannedAt == null ? "—" : t("home.scanned", { when: formatDateTime(summary.scannedAt, lang) })}</span></div>
+      <div className="divide-y divide-neutral-100 overflow-hidden rounded-xl border border-neutral-200 bg-white">
+        {ranked.map(({ report, snapshot, bytes }) => {
+          const count = diagnosticCount(report, snapshot);
+          return <article key={report.installation.id} className="p-5">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div><h4 className="font-semibold">{t(providerKeys[report.installation.provider])}</h4>
+                <p className="mt-1 text-xs text-neutral-500">{snapshot ? t("home.sessionCount", { count: snapshot.sessions.length }) : t("detail.unknown")} · {t(`status.${report.installation.status === "permission-required" ? "permissionRequired" : report.installation.status}`)}</p></div>
+              <div className="flex items-center gap-5"><span className="text-lg font-semibold tabular-nums">{snapshot ? humanBytes(bytes) : "—"}</span>
+                <button type="button" onClick={() => onBrowse(report.installation.provider)} className="rounded-md border border-neutral-200 px-3 py-2 text-xs font-medium">{t("home.viewSessions")}</button></div>
+            </div>
+            <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-neutral-100" aria-hidden="true"><div className="h-full rounded-full bg-emerald-500" style={{ width: `${summary.bytes ? bytes / summary.bytes * 100 : 0}%` }} /></div>
+            <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-neutral-500">
+              <span>{t(report.inspection.agent_running ? "home.running" : "home.idle")}</span>
+              {count > 0 ? <button type="button" onClick={onJumpToDiagnostics} className="text-amber-800 underline underline-offset-2">{t("home.attention", { count })}</button> : null}
+              <details className="ml-auto"><summary className="cursor-pointer">{t("detail.technical")}</summary><p className="mt-2 break-all font-mono">{report.installation.id}</p>
+                {report.installation.data_roots.map(root => <p key={root} className="mt-1 break-all font-mono">{root}</p>)}</details>
+            </div>
+          </article>;
+        })}
+      </div>
+    </section>
+    <p className="text-xs text-neutral-500">{t("home.privacy")}</p>
+  </div>;
 }

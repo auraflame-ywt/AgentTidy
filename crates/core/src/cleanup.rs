@@ -3,18 +3,14 @@
 //! *framework*: types, provider contract additions, Application API
 //! surface and the IPC + GUI plumbing.
 //!
-//! Phase 7 enables cleanup per resource type, each behind its own
-//! safety doc. Today only the Claude Code transcript `FileSet` is
-//! enabled (`docs/safety/session-transcript-fileset.md`); Codex and
-//! WorkBuddy still return no units — per
-//! `docs/safety/workspace-cleanup.md:13-15` and `Start.md` §2.3,
-//! `~/Documents/Codex/` is user-mixed and Codex session JSONLs leave
-//! orphan rows in `state_5.sqlite.threads`; those land in later Phase 7
-//! slices with their own per-resource-type safety docs.
+//! Phase 7 enables Claude Code / WorkBuddy file sets and Codex archived
+//! session operations behind resource-specific safety documents. Plans carry
+//! read-only evidence so a fresh IPC request can re-prove eligibility (§12.2).
 
 use crate::provider::ProviderId;
 use crate::resource::{ResourceKind, ResourceRef};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Three-level risk vocabulary per `Start.md` §7 + §11. `Blocked` is the
@@ -191,6 +187,19 @@ pub struct CleanupDecision {
     pub blockers: Vec<String>,
 }
 
+/// Read-only evidence captured at preview (`Start.md` §12.2 / §16.1).
+/// All members, including nested side-directory entries, are fingerprinted;
+/// canonical paths detect an ancestor being redirected after confirmation.
+/// This contains filesystem metadata only, never transcript contents.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupEvidence {
+    pub provider_version: Option<String>,
+    pub schema_versions: BTreeMap<String, String>,
+    pub journal_modes: BTreeMap<String, String>,
+    pub canonical_paths: BTreeMap<PathBuf, PathBuf>,
+    pub members: Vec<ResourceFingerprint>,
+}
+
 /// One row in [`CleanupPlan::items`]. Carries the snapshot the executor
 /// needs: unit id, fingerprint to compare against, action + risk. The
 /// `installation_id` + `provider` are denormalized from the unit so the
@@ -198,6 +207,8 @@ pub struct CleanupDecision {
 /// right adapter without re-scanning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupItem {
+    /// Required on IPC: older previews must be rebuilt, never executed blindly.
+    pub evidence: CleanupEvidence,
     pub unit_id: String,
     pub installation_id: String,
     pub provider: ProviderId,
@@ -206,8 +217,8 @@ pub struct CleanupItem {
     /// *whole* artifact without re-scanning (a `FileSet` item must move
     /// every member path, §9.5 atomicity).
     pub locator: CleanupLocator,
-    /// Denormalized from the unit — the plan's honest reclaim estimate,
-    /// also recorded as `reclaimed_bytes` on success (§16.3).
+    /// Denormalized from the unit — the plan's preview estimate (§16.3),
+    /// never substituted for measured reclaimed bytes after execution.
     pub estimated_reclaimable_bytes: u64,
     pub action: CleanupAction,
     pub risk: RiskLevel,
@@ -261,9 +272,8 @@ pub struct CleanupPlan {
     pub items: Vec<CleanupItem>,
     pub total_reclaimable_bytes: u64,
     pub risk_summary: RiskSummary,
-    /// SHA-256 over `(plan_id, scan_id, sorted_unit_ids, total_reclaimable_bytes, risk_summary)`.
-    /// The executor refuses to run if the freshly-revalidated plan's hash
-    /// differs from the frontend's.
+    /// SHA-256 over plan metadata, expiry and the complete ordered item payload.
+    /// Recomputed before execution; live eligibility is independently re-proved.
     pub fingerprint: String,
 }
 
@@ -273,8 +283,9 @@ pub struct CleanupPlan {
 pub struct CleanupItemOutcome {
     pub unit_id: String,
     pub outcome: CleanupOutcome,
+    /// Verified physical reclamation only. A Trash move normally reports 0.
     pub reclaimed_bytes: u64,
-    /// Empty on `Removed`; populated on `Skipped` / `Failed`.
+    /// Operation/recovery details or a skip/failure explanation.
     pub reason: Option<String>,
 }
 

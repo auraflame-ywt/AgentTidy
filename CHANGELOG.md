@@ -14,12 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   atomic trash units (transcript + same-named side directory) for
   recognized, exclusively-owned sessions, gated by the new
   `docs/safety/session-transcript-fileset.md`; unrecognized/mismatched
-  transcripts never form units, and Codex / WorkBuddy remain report-only
-  behind their own Phase 7 gates. Supporting pieces: multi-path
+  transcripts never form units; other resource types have their own
+  Phase 7 gates. Supporting pieces: multi-path
   `trash::move_paths_to_trash` with honest §12.3 partial-failure
   aggregation; the §12.1 cross-process operation guard
-  (`$HOME/.agenttidy/operations.lock`, stale-lock takeover for crash
-  recovery); `validate_cleanup_unit` now takes the installation so
+  (`$HOME/.agenttidy/operations.lock`, OS advisory lock with crash
+  release); `validate_cleanup_unit` now takes the installation so
   §16.1 containment (canonicalized data-root boundaries, symlink-escape
   rejection, verified `projects/<slug>/` layout) is actually enforceable;
   `CleanupUnit`/`CleanupItem` carry a typed `CleanupLocator` (the full
@@ -42,21 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requires a fresh preview. Plan expiry (5-min TTL) now gates both CTAs
   with a "plan expired — rescan" notice, checked live at click time.
 - **Phase 7 second cleanup slice — Codex archived-session
-  `ProviderOperation` beta** (gated by the new
+  `ProviderOperation` candidate preview (execution disabled)** (gated by the new
   `docs/safety/provider-operation.md`): `AgentProviderAdapter` gains
   `execute_provider_operation` (default `Failed("not supported")`) and
   the executor dispatches `CleanupAction::ProviderOperation` items to
   it. Codex emits one `DbRow`-locator unit per archived, exclusively-
-  owned session; execution prefers the native `codex delete <id>` CLI
-  (verified against codex-cli 0.152.0) and falls back to the §12.4
-  self-implementation: verified backup (`VACUUM INTO` +
-  `quick_check`) → writable private temp copy → `BEGIN IMMEDIATE`
-  coordinated delete of `threads` / `thread_attachments` /
-  `thread_spawn_edges` → `wal_checkpoint` + integrity gates → atomic
-  rename over the agent's source DB. Recovery is from the SQLite
-  backup under `~/.agenttidy/backup/`, never branded "Move to Trash"
-  (§12.4 / red line #8). `inspect()` now surfaces `state_5`
-  `user_version` + journal mode.
+  owned session; candidates remain Blocked pending verified native deletion
+  and complete recovery. Native deletion and automatic DB replacement are
+  disabled, never branded "Move to Trash" (§12.4 / red line #8).
+  `inspect()` surfaces `state_5` `user_version`, schema SQL
+  and journal mode for revalidation.
 - **Phase 7 third cleanup slice — WorkBuddy session `FileSet` beta**
   (gated by the new `docs/safety/workbuddy-session-fileset.md`; the
   `sessions` table contract is frozen as v1 in
@@ -73,7 +68,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared §16.1 path-safety block lives in
   `infrastructure::paths::validate_transcript_fileset_paths`.
 
+- Local Mac scenario coverage: session search / Agent, lifecycle and age
+  filters / size and activity sorting / 50-row pagination; frontend regression
+  tests now run in CI. Cleanup requests serialize, ignore cancelled responses,
+  expire confirmation live, and require a fresh preview after any execution
+  attempt. Provider operations have action-appropriate confirmation copy.
+
+### Changed
+
+- New graphite/silver/emerald desktop identity with a sculptural archive mark,
+  exported from committed transparent artwork to ICNS, ICO, desktop PNGs and
+  favicon. The workspace header and startup screen share the same icon.
+- Brand startup page follows real scan state, allows background browsing and
+  exposes retry/Diagnostics after failure. It exits automatically when ready,
+  respects reduced motion and can be reopened from the workspace icon.
+
+- Mac desktop overview now leads with identified storage, agent distribution,
+  diagnostics and direct links to the largest sessions. Session details expose
+  linked resources and backend cleanup conditions without loading message bodies.
+- Cleanup review prioritizes session/project identity and lifecycle explanations;
+  paths, plan IDs and technical reasons remain available on demand. Current-attempt
+  receipts show only submitted items and explain manual Trash recovery, original
+  locations and partial failures. Identity labels survive the post-cleanup scan.
+- Read-only and cleanup request hooks are separate modules. Cleanup preview is
+  generated on the first Review visit instead of adding a third scan at startup;
+  navigation does not cancel an execution or discard session filters.
+
+- Codex cleanup stays Blocked until complete database/transcript/index/
+  attachment recovery is verified. The native mutation entry point is disabled.
+  Read-only CLI admission checks run in preview and Diagnostics, scoped to
+  the detected `CODEX_HOME`; a supported CLI alone cannot enable cleanup.
+
 ### Fixed
+
+- Codex thread timestamps are converted from verified Unix seconds to domain
+  milliseconds, fixing 1970 dates, ordering and age filters. Native CLI probes
+  have a three-second deadline and kill the child on cancellation so desktop
+  launchers cannot hold the first scan indefinitely.
+- Overview diagnostics merge inspection and scan codes without double counting;
+  inspected warnings are no longer hidden whenever a snapshot is present.
+
+- Shared-database selections are rejected in full before any mutation instead
+  of invalidating later rows after deleting the first session. Canonical aliases
+  and hard links cannot bypass the restriction; use one DB session per fresh
+  preview until a coordinated provider batch contract is validated.
+- Missing, failing and unsupported Codex CLIs are reported before confirmation;
+  recovery and CLI blockers have explicit English/Chinese preview explanations.
+
+- macOS Trash uses NSFileManager instead of Finder AppleScript. Strict local
+  file/directory move-and-restore acceptance covers CJK, spaces and quotes.
+  Trash moves no longer claim estimated bytes as physical disk reclamation.
+- WorkBuddy's macOS Electron executable is recognized from its bundle path,
+  preventing a running WorkBuddy 5.8.3 from being treated as stopped.
+- Cleanup uses an OS-held persistent-file lock with crash release, not age-based
+  takeover. Audit sinks open before mutation, sync intent/result events and
+  preserve new events after truncated crash lines. Unsafe preview units become
+  Blocked rows without hiding healthy units; blocker reasons appear first.
+- Codex native deletion remains disabled: the isolated protocol experiment did
+  not establish successful deletion or complete recovery on the local Mac.
+  Neither native execution nor database replacement is enabled by a CLI probe.
+
+- Cleanup execution rediscovers installations across independent IPC calls;
+  Codex database fingerprints now use DB metadata throughout. Execution
+  holds the operation guard before fresh per-item scans, re-applies policy
+  and provider validation, compares schema/journal and complete file-set
+  metadata evidence, and binds full item payloads/expiry to confirmation.
+  Selected stale/blocked items are audited without mutation.
+- SQLite backups run `VACUUM INTO` on the read-only source, include live WAL
+  frames in a standalone snapshot and refuse to overwrite recovery points.
+  The torn raw-copy fallback has been removed. Headless Trash regressions
+  no longer assume that a failed move removed the original files.
 
 - Windows locked-file classification (§16.2 / §12.3): a member held
   open by another process is now recognized from the platform error

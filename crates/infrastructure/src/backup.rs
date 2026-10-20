@@ -3,7 +3,7 @@
 //!
 //! Every Codex (or future provider) delete-then-replace sequence starts
 //! with `backup_sqlite_with_sidecars`: a `VACUUM INTO` snapshot of the
-//! live database plus copies of its `-wal` / `-shm` sidecars, written
+//! live database including its committed WAL contents, written
 //! under `~/.agenttidy/backup/<plan-id>-<unit-id>-<ts>.sqlite`. The
 //! backup path is then recorded in the audit log's `reason` field so
 //! recovery is possible without a separate restore UI (`Start.md`
@@ -19,24 +19,22 @@
 //! - It returns a freshly created file; no truncation race with
 //!   concurrent writers.
 //!
-//! The `fs::copy` fallback is kept for builds where the linked SQLite
-//! is older than 3.27 (the version that introduced `VACUUM INTO`).
-//! Both paths end with a `PRAGMA quick_check` on the resulting file
-//! so a corrupt backup fails the operation before the original is
-//! touched.
+//! The bundled SQLite supports `VACUUM INTO`; errors fail closed. A raw
+//! copy fallback cannot guarantee a consistent WAL snapshot. Backups are
+//! self-contained and must not be paired with copies of the source WAL.
 
 use std::path::{Path, PathBuf};
 
-/// Snapshot `src` (+ `-wal` + `-shm` if present) into `backup_dir`.
+/// Snapshot `src`, including committed WAL contents, into `backup_dir`.
 /// Returns the absolute path of the backup's primary database file.
 /// On success the caller can `mv` the backup to its eventual
 /// destination (typically under
 /// `~/.agenttidy/backup/<plan-id>-<unit-id>-<ts>.sqlite`).
 ///
-/// `backup_dir` is created if it does not exist. Files inside it
-/// that already match the chosen `file_stem` are silently
-/// overwritten — re-running the same plan must produce a fresh
-/// snapshot for idempotency.
+/// `backup_dir` is created if needed. Existing recovery points are never
+/// overwritten; callers must supply a unique stem for each attempt. The
+/// legacy function name is retained, but WAL contents are folded into the
+/// standalone database rather than copied as sidecars.
 pub fn backup_sqlite_with_sidecars(
     src: &Path,
     backup_dir: &Path,
@@ -49,22 +47,17 @@ pub fn backup_sqlite_with_sidecars(
 
     let backup_path = backup_dir.join(format!("{file_stem}.sqlite"));
 
-    // Prefer `VACUUM INTO`; fall back to `fs::copy` if the linked
-    // SQLite is older than 3.27 or the pragma returns an error.
-    let primary_outcome = run_vacuum_into(src, &backup_path);
-    if primary_outcome.is_err() {
-        // The fallback is best-effort: copy the primary file and the
-        // WAL sidecars as they stand. Recovery from this snapshot is
-        // only safe if the agent was not running concurrently; the
-        // caller's pre-checks (agent_running + writer locks) gate
-        // that.
-        std::fs::copy(src, &backup_path)?;
-        for suffix in ["-wal", "-shm"] {
-            let mut candidate = src.as_os_str().to_os_string();
-            candidate.push(suffix);
-            let dst = backup_dir.join(format!("{file_stem}.sqlite{suffix}"));
-            let _ = std::fs::copy(Path::new(&candidate), dst);
-        }
+    // Reserve a new name without clobbering an earlier recovery point.
+    // Bundled SQLite supports VACUUM INTO; a failed consistent snapshot
+    // must not silently degrade to a potentially torn file copy (§12.4).
+    let reserved = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&backup_path)?;
+    drop(reserved);
+    if let Err(error) = run_vacuum_into(src, &backup_path) {
+        std::fs::remove_file(&backup_path).ok();
+        return Err(error.into());
     }
 
     // Integrity gate: refuse to return a snapshot that fails
@@ -85,55 +78,19 @@ pub fn backup_sqlite_with_sidecars(
     Ok(backup_path)
 }
 
-/// Run `VACUUM INTO` on a copy connection (we cannot write to the
-/// agent's source, even briefly — the backup must not mutate the
-/// original). The cleanest way is to open the *backup file* first,
-/// then call `VACUUM INTO` against the source URI.
+/// SQLite reads a consistent source snapshot (including committed WAL frames)
+/// and writes a standalone backup. Binding the destination avoids quoting and
+/// URI interpretation of arbitrary user paths (§16.1).
 fn run_vacuum_into(src: &Path, backup_path: &Path) -> rusqlite::Result<()> {
-    // `VACUUM INTO` requires writing to a path; we open the
-    // *destination* (the backup) as a writable file, then run
-    // `VACUUM INTO` from a read-only view of the source. The
-    // pragma syntax takes a string literal so the path must be
-    // single-quoted; any embedded single quote is escaped per the
-    // SQLite convention (replace ' with '').
-    let src_uri = format!("file:{}?mode=ro", to_uri_path(src));
-    let escaped = backup_path.to_string_lossy().replace('\'', "''");
-    let pragma = format!("VACUUM INTO '{escaped}'");
-    let conn = rusqlite::Connection::open(backup_path)?;
-    conn.execute_batch(&pragma)?;
-    // The pragma above replaces the backup file in place; we do
-    // not actually need `src_uri`, but the function keeps it for
-    // parity with the public API. `pragma_query` reads the source
-    // for a sanity check that the source opened in some way.
-    let _: String = conn
-        .query_row(&src_uri, [], |_| Err(rusqlite::Error::QueryReturnedNoRows))
-        .unwrap_or_default();
+    let conn =
+        rusqlite::Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.execute("VACUUM INTO ?1", [backup_path.to_string_lossy().as_ref()])?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(backup_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     Ok(())
-}
-
-/// Best-effort URI path encoding for SQLite file URIs (mirrors the
-/// logic in `sqlite::to_sqlite_uri`, kept local so the backup helper
-/// does not depend on a read-only module's internals).
-fn to_uri_path(path: &Path) -> String {
-    let Some(s) = path.as_os_str().to_str() else {
-        return format!("{}", path.display());
-    };
-    s.replace('\\', "/")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '~') {
-                c.to_string()
-            } else {
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                let mut out = String::with_capacity(encoded.len() * 3);
-                for byte in encoded.bytes() {
-                    out.push_str(&format!("%{byte:02X}"));
-                }
-                out
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -184,10 +141,7 @@ mod tests {
         cleanup(&backup_dir);
     }
 
-    /// The fallback (`fs::copy`) path activates when `VACUUM INTO`
-    /// fails — we cannot easily inject that failure without
-    /// monkey-patching SQLite, but the function's structure must
-    /// still cover the "source is not a file" branch.
+    /// A missing source fails before reserving or writing a recovery point.
     #[test]
     fn backup_rejects_nonexistent_source() {
         let backup_dir = temp_dir("backup-reject");
@@ -198,12 +152,8 @@ mod tests {
         cleanup(&backup_dir);
     }
 
-    /// The backup's primary file is always produced and `quick_check`-
-    /// validated; the WAL/SHM sidecars are best-effort and may be
-    /// absent for small databases (SQLite lazily flushes the WAL).
-    /// This test only asserts the primary contract; a separate
-    /// integration test with a long-running transaction would
-    /// exercise the WAL-copy branch deterministically.
+    /// WAL-mode databases produce a standalone, quick-checkable backup;
+    /// a separate live-WAL test keeps the source connection open.
     #[test]
     fn backup_produces_quick_checkable_primary_file() {
         let src_dir = temp_dir("src-wal");
@@ -226,5 +176,35 @@ mod tests {
         assert_eq!(count, 1);
         cleanup(&src_dir);
         cleanup(&backup_dir);
+    }
+    /// Keep the writer connection open so committed rows remain in the WAL.
+    /// A raw copy of only the main file cannot satisfy this regression (§18.4).
+    #[test]
+    fn backup_includes_live_wal_and_preserves_existing_recovery_points() {
+        let root = temp_dir("live-wal");
+        let source = root.join("source.sqlite");
+        let writer = rusqlite::Connection::open(&source).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE records (id INTEGER); INSERT INTO records VALUES (42);",
+            )
+            .unwrap();
+        let backup = backup_sqlite_with_sidecars(&source, &root, "recovery").unwrap();
+        let reader = rusqlite::Connection::open(&backup).unwrap();
+        let value: i64 = reader
+            .query_row("SELECT id FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 42);
+        drop(reader);
+        let original = std::fs::read(&backup).unwrap();
+        writer
+            .execute("INSERT INTO records VALUES (99)", [])
+            .unwrap();
+        assert!(backup_sqlite_with_sidecars(&source, &root, "recovery").is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert!(!root.join("recovery.sqlite-wal").exists());
+        drop(writer);
+        cleanup(&root);
     }
 }

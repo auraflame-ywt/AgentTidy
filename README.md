@@ -18,9 +18,28 @@ See [`Start.md`](./Start.md) for the full v0.1 design document (Chinese).
 
 ## Status
 
-Pre-alpha. Project skeleton only — see the
-[development phases](./Start.md#19-开发顺序). First release targets read-only
-analysis of **WorkBuddy**, **Claude Code** and **Codex** on macOS and Windows.
+Pre-release, **Phase 7 cleanup Beta under validation**. Read-only detection,
+scanning, sessions and diagnostics are implemented for **WorkBuddy**,
+**Claude Code** and **Codex**, through a shared Rust API, CLI and Tauri GUI.
+Claude Code / WorkBuddy session file sets support guarded Trash cleanup;
+Codex archived-session candidates remain Blocked until native deletion and
+complete session recovery pass acceptance; CLI admission is shown in preview
+and Diagnostics.
+Default workspaces remain report-only. Real-user Beta and macOS / Windows
+recovery and compatibility acceptance are still pending.
+
+Local Mac scenario coverage and remaining gates are recorded in
+[macOS acceptance](./docs/testing/macos-scenarios.md).
+
+The Mac desktop now includes storage ranking, searchable sessions with resource
+details, cleanup receipts and a unified app icon/startup screen. The latest
+checks passed 165 Rust tests and 17 frontend regressions; these local results
+do not replace real-user cleanup/recovery acceptance. See the
+[2026-10-20 progress summary](./docs/CHANGELOG.md)
+and [brand assets](./apps/desktop/assets/BRAND.md).
+
+See [project progress](./docs/CHANGELOG.md) and the
+[development phases](./Start.md#19-开发顺序).
 
 ## Architecture
 
@@ -68,6 +87,7 @@ pnpm install                     # frontend dependencies
 cargo build --workspace          # build all Rust crates
 cargo test --workspace           # run tests
 cargo run -p agenttidy-cli       # run the CLI
+pnpm test:desktop                # session / confirmation regression tests
 pnpm tauri dev                   # run the desktop app
 ```
 

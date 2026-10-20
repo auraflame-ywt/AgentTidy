@@ -161,7 +161,8 @@ process" (see `trash.rs` for the platform error-code mapping).
 
 ## Audit log (§16.3)
 
-One `agenttidy.audit.v1` row per item at
+A synced `Pending` intent precedes each mutation, followed by its final
+`agenttidy.audit.v1` result at
 `$HOME/.agenttidy/operations.jsonl`: plan id, unit id, provider, the
 `file-set` locator (all original member paths), action `trash`,
 outcome, estimated/actual reclaimed bytes and skip/failure reasons.

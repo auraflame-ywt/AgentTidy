@@ -11,15 +11,16 @@ use agenttidy_claude_code::ClaudeCodeAdapter;
 use agenttidy_codex::CodexAdapter;
 use agenttidy_core::{
     AgentCapabilities, AgentInstallation, AgentSnapshot, CleanupAction, CleanupDecision,
-    CleanupEvent, CleanupItem, CleanupItemOutcome, CleanupOutcome, CleanupPlan,
+    CleanupEvent, CleanupEvidence, CleanupItem, CleanupItemOutcome, CleanupOutcome, CleanupPlan,
     CleanupPreconditionKind, CleanupRevalidationOutcome, CleanupUnit, CleanupUnitKind, Ownership,
-    Platform as CorePlatform, ProviderId, ProviderRegistry, Resource, ResourceKind, RiskLevel,
-    RiskSummary, ScanOptions, Session, SessionLifecycle,
+    ProviderId, ProviderRegistry, Resource, ResourceKind, RiskLevel, RiskSummary, ScanOptions,
+    Session, SessionLifecycle,
 };
 use agenttidy_infrastructure::{
     audit_log,
     fs_probe::{walk_tree, EntryKind},
     operation_guard,
+    paths::safe_canonicalize,
     trash::{self, PathTrashResult, TrashError, TrashOutcome},
 };
 use agenttidy_provider_api::{AgentProviderAdapter, ProviderInspection};
@@ -65,12 +66,6 @@ pub struct WorkspaceCleanupCandidate {
 /// The single shared application API for AgentTidy's current read-only flow.
 pub struct Application {
     providers: ProviderRegistry<Box<dyn AgentProviderAdapter>>,
-    /// Cached installations keyed by `installation_id`, populated by
-    /// `cleanup_plan_from_snapshots` and used by `cleanup_execute` to
-    /// resolve an item's `installation_id` back to its full
-    /// `AgentInstallation` (providers need `data_roots` for path
-    /// validation in `execute_provider_operation`, §16.1).
-    installations: std::sync::Mutex<BTreeMap<String, AgentInstallation>>,
 }
 
 impl Application {
@@ -94,41 +89,7 @@ impl Application {
                 Box::new(WorkBuddyAdapter),
             )
             .expect("WorkBuddy registers once");
-        Self {
-            providers,
-            installations: std::sync::Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    /// Look up a cached installation by id. Returns `None` when the
-    /// installation has not been seen by a recent plan-build (the
-    /// caller almost certainly forgot to call
-    /// `cleanup_plan_from_snapshots` first).
-    fn installation_for(&self, installation_id: &str) -> Option<AgentInstallation> {
-        self.installations
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(installation_id).cloned())
-    }
-
-    /// Replace the installation cache with the given snapshot. Called
-    /// by `cleanup_plan_from_snapshots` before building items so the
-    /// executor can resolve `installation_id` back to the full record.
-    fn remember_installations(&self, snapshots: &[AgentSnapshot]) {
-        let mut cache = match self.installations.lock() {
-            Ok(cache) => cache,
-            // A poisoned cache means a previous call panicked while
-            // holding the lock. Recover by clearing it — better to
-            // re-scan than to wedge the executor on a poison.
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        cache.clear();
-        for snapshot in snapshots {
-            cache.insert(
-                snapshot.installation.id.clone(),
-                snapshot.installation.clone(),
-            );
-        }
+        Self { providers }
     }
 
     /// Detect every known installation in stable provider order.
@@ -296,10 +257,7 @@ impl Application {
     //   for each selected unit whose preconditions still hold, and
     //   appends one `CleanupEvent` per item to the audit log (§16.3).
     //
-    // Phase 6 ships this *framework-only*: every provider's
-    // `build_cleanup_units` returns empty, so `cleanup_plan_from_snapshots`
-    // emits a plan with zero items. Phase 7's provider beta turns on the
-    // first real cleanup units.
+    // Phase 7 providers opt in per resource type behind docs/safety/ gates.
     // -----------------------------------------------------------------
 
     /// Pure policy (§11). Maps a unit + context to a typed decision.
@@ -499,10 +457,9 @@ impl Application {
         decision
     }
 
-    /// Build a typed cleanup plan. Async because each provider's
-    /// `build_cleanup_units` may do filesystem / SQLite work in future
-    /// phases (Phase 7's overrides). Phase 6 providers all return empty,
-    /// so this is effectively a fingerprint-stamping pass.
+    /// Build a typed cleanup plan from provider units, policy decisions and
+    /// read-only metadata evidence (§12.1). Provider validation is mandatory
+    /// before a unit crosses the preview/execute IPC boundary.
     pub async fn cleanup_plan_from_snapshots(
         &self,
         snapshots: &[AgentSnapshot],
@@ -512,20 +469,13 @@ impl Application {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        // Cache installations before building items so the executor
-        // can resolve `installation_id` back to the full record when
-        // dispatching `ProviderOperation` (§16.1 path safety needs
-        // `data_roots`).
-        self.remember_installations(snapshots);
-
-        // Pre-fetch inspections for every installation in one pass so the
-        // policy can read agent_running + schema facts without re-hitting
-        // providers per unit.
-        let mut inspection_by_installation: BTreeMap<String, ProviderInspection> = BTreeMap::new();
-        for installation in self.detect().await? {
-            if let Some(provider) = self.providers.get(&installation.provider) {
-                let inspection = provider.inspect(&installation).await?;
-                inspection_by_installation.insert(installation.id.clone(), inspection);
+        // Capture the exact inspection used by policy; evidence travels across
+        // independent preview/execute IPC requests rather than an instance cache.
+        let mut inspection_by_installation = BTreeMap::new();
+        for snapshot in snapshots {
+            if let Some(provider) = self.providers.get(&snapshot.installation.provider) {
+                let inspection = provider.inspect(&snapshot.installation).await?;
+                inspection_by_installation.insert(snapshot.installation.id.clone(), inspection);
             }
         }
 
@@ -543,7 +493,7 @@ impl Application {
             let inspection = inspection_by_installation
                 .get(&installation_id)
                 .cloned()
-                .unwrap_or_else(ProviderInspection::empty_for_testing);
+                .ok_or_else(|| anyhow::anyhow!("missing installation inspection"))?;
 
             let ctx = CleanupContext {
                 snapshot,
@@ -552,19 +502,48 @@ impl Application {
             };
 
             for unit in units {
-                // §16.1 + §12.2 admission: the provider re-validates the
-                // unit's paths against its data roots and declares the
-                // typed preconditions before the unit may enter a plan.
-                // Validation failure fails the whole plan build — no
-                // silent drops (fail-closed).
-                let preconditions = provider
+                // A failed unit is visible as Blocked, not a global preview
+                // failure that hides other installed providers (§6.3 / §7.3).
+                let mut decision = Self::cleanup_policy_evaluate(&unit, &ctx);
+                let preconditions = match provider
                     .validate_cleanup_unit(&unit, &snapshot.installation)
-                    .await?;
-                let decision = Self::cleanup_policy_evaluate(&unit, &ctx);
-                total_reclaimable_bytes =
-                    total_reclaimable_bytes.saturating_add(unit.estimated_reclaimable_bytes);
+                    .await
+                {
+                    Ok(preconditions) => preconditions,
+                    Err(error) => {
+                        decision.risk = RiskLevel::Blocked;
+                        decision.recommended = false;
+                        decision
+                            .blockers
+                            .push(format!("provider safety validation failed: {error}"));
+                        unit.preconditions.clone()
+                    }
+                };
+                let evidence = match cleanup_evidence(&unit, &inspection, snapshot) {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        decision.risk = RiskLevel::Blocked;
+                        decision.recommended = false;
+                        decision
+                            .blockers
+                            .push(format!("cannot prove complete member evidence: {error}"));
+                        CleanupEvidence::default()
+                    }
+                };
+                // Hard blockers are the user's actionable explanation, not an
+                // innocuous “agent not running” message ahead of the real cause.
+                let reasons = decision
+                    .blockers
+                    .into_iter()
+                    .chain(decision.reasons)
+                    .collect();
+                if decision.risk != RiskLevel::Blocked {
+                    total_reclaimable_bytes =
+                        total_reclaimable_bytes.saturating_add(unit.estimated_reclaimable_bytes);
+                }
                 risk_summary.add(decision.risk, unit.estimated_reclaimable_bytes);
                 items.push(CleanupItem {
+                    evidence,
                     unit_id: unit.id.clone(),
                     installation_id: unit.installation_id.clone(),
                     provider: unit.provider.clone(),
@@ -573,7 +552,7 @@ impl Application {
                     estimated_reclaimable_bytes: unit.estimated_reclaimable_bytes,
                     action: unit.operation.action,
                     risk: decision.risk,
-                    reasons: decision.reasons,
+                    reasons,
                     preconditions,
                 });
             }
@@ -595,6 +574,8 @@ impl Application {
             &items,
             total_reclaimable_bytes,
             &risk_summary,
+            now_ms,
+            expires_at,
         );
 
         Ok(CleanupPlan {
@@ -633,22 +614,172 @@ impl Application {
                 .collect());
         }
 
-        // Build the latest inspection set per installation.
-        let mut inspection_by_installation: BTreeMap<String, ProviderInspection> = BTreeMap::new();
-        for installation in self.detect().await? {
-            if let Some(provider) = self.providers.get(&installation.provider) {
-                let inspection = provider.inspect(&installation).await?;
-                inspection_by_installation.insert(installation.id.clone(), inspection);
-            }
-        }
-
+        let installations = self.detect().await?;
         let mut outcomes = Vec::with_capacity(plan.items.len());
         for item in &plan.items {
-            let outcome =
-                revalidate_item(item, inspection_by_installation.get(&item.installation_id));
-            outcomes.push(outcome);
+            outcomes.push(self.revalidate_live_item(item, &installations).await);
         }
         Ok(outcomes)
+    }
+
+    /// Reconstruct authoritative units rather than trusting a plan returned
+    /// over IPC (§12.2). Fresh scans re-prove lifecycle, ownership, membership
+    /// and policy; provider validation re-proves its path/DB/lock contracts.
+    async fn revalidate_live_item(
+        &self,
+        item: &CleanupItem,
+        installations: &[AgentInstallation],
+    ) -> CleanupRevalidationOutcome {
+        let rejected = |kind, reason: String| CleanupRevalidationOutcome {
+            unit_id: item.unit_id.clone(),
+            outcome: CleanupOutcome::Skipped,
+            failed_precondition: Some(kind),
+            reason: Some(reason),
+        };
+        let Some(installation) = installations.iter().find(|installation| {
+            installation.id == item.installation_id
+                && installation.provider == item.provider
+                && installation.is_available()
+        }) else {
+            return rejected(
+                CleanupPreconditionKind::PathExists,
+                "installation is missing, unavailable or belongs to another provider".into(),
+            );
+        };
+        let Some(provider) = self.providers.get(&item.provider) else {
+            return rejected(
+                CleanupPreconditionKind::PathExists,
+                "provider unavailable".into(),
+            );
+        };
+        let inspection = match provider.inspect(installation).await {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                return rejected(
+                    CleanupPreconditionKind::NoAgentRunning,
+                    format!("cannot inspect installation safely: {error}"),
+                )
+            }
+        };
+        let filesystem = revalidate_item(item, Some(&inspection));
+        if filesystem.outcome != CleanupOutcome::Pending {
+            return filesystem;
+        }
+        if inspection.version != item.evidence.provider_version
+            || inspection.schema_versions != item.evidence.schema_versions
+            || inspection.journal_modes != item.evidence.journal_modes
+        {
+            return rejected(
+                CleanupPreconditionKind::SchemaUnchanged,
+                "provider version, schema or journal mode changed — rescan".into(),
+            );
+        }
+        let snapshot = match provider.scan(installation, &ScanOptions::default()).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return rejected(
+                    CleanupPreconditionKind::SessionInactive,
+                    format!("cannot re-prove session state: {error}"),
+                )
+            }
+        };
+        let units = match provider.build_cleanup_units(&snapshot).await {
+            Ok(units) => units,
+            Err(error) => {
+                return rejected(
+                    CleanupPreconditionKind::SessionInactive,
+                    format!("cannot rebuild cleanup units: {error}"),
+                )
+            }
+        };
+        let Some(unit) = units.iter().find(|unit| unit.id == item.unit_id) else {
+            return rejected(
+                CleanupPreconditionKind::SessionInactive,
+                "session no longer forms a verified cleanup unit — rescan".into(),
+            );
+        };
+        if unit.locator != item.locator
+            || unit.operation.action != item.action
+            || unit.provider != item.provider
+            || unit.installation_id != item.installation_id
+        {
+            return rejected(
+                CleanupPreconditionKind::PathUnchanged,
+                "cleanup action or unit membership changed — rescan".into(),
+            );
+        }
+        if let Err(error) = provider.validate_cleanup_unit(unit, installation).await {
+            return rejected(
+                CleanupPreconditionKind::FilesystemEligible,
+                format!("provider safety validation failed: {error}"),
+            );
+        }
+        let final_inspection = match provider.inspect(installation).await {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                return rejected(
+                    CleanupPreconditionKind::NoAgentRunning,
+                    format!("final inspection failed: {error}"),
+                )
+            }
+        };
+        if final_inspection != inspection {
+            return rejected(
+                CleanupPreconditionKind::NoAgentRunning,
+                "provider inspection changed while revalidating — rescan".into(),
+            );
+        }
+        if inspection.readable_roots.values().any(|readable| !readable)
+            || inspection
+                .problems
+                .values()
+                .any(|problem| matches!(problem, agenttidy_core::ScanProblem::Error { .. }))
+        {
+            return rejected(
+                CleanupPreconditionKind::FilesystemEligible,
+                "provider inspection cannot prove readable, safe state".into(),
+            );
+        }
+        let ctx = CleanupContext {
+            snapshot: &snapshot,
+            inspection: &inspection,
+            now_ms: now_ms(),
+        };
+        let decision = Self::cleanup_policy_evaluate(unit, &ctx);
+        if item.risk == RiskLevel::Blocked
+            || decision.risk == RiskLevel::Blocked
+            || item.risk != decision.risk
+        {
+            return rejected(
+                CleanupPreconditionKind::SessionInactive,
+                format!(
+                    "cleanup is blocked or its risk changed: {}",
+                    decision.blockers.join("; ")
+                ),
+            );
+        }
+        let current = match cleanup_evidence(unit, &inspection, &snapshot) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return rejected(
+                    CleanupPreconditionKind::NoSymlinkOutsideRoot,
+                    format!("cannot re-prove all member paths: {error}"),
+                )
+            }
+        };
+        if current.canonical_paths != item.evidence.canonical_paths {
+            return rejected(
+                CleanupPreconditionKind::PathUnchanged,
+                "canonical member paths changed — rescan".into(),
+            );
+        }
+        if current.members != item.evidence.members {
+            return rejected(
+                CleanupPreconditionKind::IdentityUnchanged,
+                "file-set member identity, size, mtime or membership changed — rescan".into(),
+            );
+        }
+        filesystem
     }
 
     /// Execute the selected items: revalidate, then call
@@ -682,15 +813,39 @@ impl Application {
             );
         }
 
-        let revalidation = self.cleanup_revalidate(plan).await?;
-        // §12.1: hold the cross-process operation guard for the whole
-        // batch so a second GUI window / CLI instance cannot execute the
-        // same plan concurrently (§12.3: a re-run must not look like a
-        // fresh success). Released by RAII after the last audit row.
+        let expected = plan_fingerprint(
+            &plan.id,
+            &plan.scan_id,
+            &plan.items,
+            plan.total_reclaimable_bytes,
+            &plan.risk_summary,
+            plan.created_at,
+            plan.expires_at,
+        );
+        if expected != plan.fingerprint {
+            anyhow::bail!("plan payload fingerprint mismatch — rescan before executing");
+        }
+        let ids: std::collections::BTreeSet<_> =
+            plan.items.iter().map(|item| &item.unit_id).collect();
+        if ids.len() != plan.items.len() || selected_unit_ids.iter().any(|id| !ids.contains(id)) {
+            anyhow::bail!("invalid or duplicate cleanup unit ids");
+        }
+        // A native DB mutation invalidates the shared DB/WAL evidence of every
+        // other row in this plan. Until providers expose a coordinated batch
+        // contract, reject the whole selection before locks/audit/mutation;
+        // never silently execute only its first row (§12.2 / §12.3).
+        validate_database_batch(plan, selected_unit_ids)?;
+        // Serialize before inspecting, not after it. A previous operation may
+        // change a shared DB; each item is checked again under this guard.
         let _guard = operation_guard::OperationGuard::acquire()
             .map_err(|error| anyhow::anyhow!("cannot acquire cleanup operation guard: {error}"))?;
+        // If the audit destination is unavailable, fail before touching any
+        // selected resource. Results cannot be made durable after the fact.
+        let mut audit = audit_log::AuditWriter::open()?;
+        let installations = self.detect().await?;
+        let mut audit_failure: Option<String> = None;
         let mut results = Vec::new();
-        for (item, revalidation) in plan.items.iter().zip(revalidation.iter()) {
+        for item in &plan.items {
             if !selected_unit_ids.contains(&item.unit_id) {
                 // User did not select this unit; record as Pending skipped.
                 results.push(CleanupItemOutcome {
@@ -701,20 +856,56 @@ impl Application {
                 });
                 continue;
             }
-            if revalidation.outcome != CleanupOutcome::Pending {
-                // Revalidation flagged this item as stale — record outcome
-                // and skip without touching the filesystem.
+            if let Some(error) = &audit_failure {
                 results.push(CleanupItemOutcome {
                     unit_id: item.unit_id.clone(),
-                    outcome: revalidation.outcome,
+                    outcome: CleanupOutcome::Skipped,
                     reclaimed_bytes: 0,
-                    reason: revalidation.reason.clone(),
+                    reason: Some(format!(
+                        "batch stopped because audit logging failed: {error}"
+                    )),
                 });
                 continue;
             }
+            let revalidation = if plan_expired(plan, now_ms()) {
+                CleanupRevalidationOutcome {
+                    unit_id: item.unit_id.clone(),
+                    outcome: CleanupOutcome::Skipped,
+                    failed_precondition: None,
+                    reason: Some("plan expired during execution — rescan".into()),
+                }
+            } else {
+                self.revalidate_live_item(item, &installations).await
+            };
 
             let locator = item.locator.clone();
             let action = item.action;
+
+            if revalidation.outcome == CleanupOutcome::Pending && !plan_expired(plan, now_ms()) {
+                let intent = CleanupEvent {
+                    schema_version: CleanupEvent::SCHEMA_VERSION.into(),
+                    platform: agenttidy_infrastructure::paths::host_platform(),
+                    timestamp_ms: now_ms(),
+                    plan_id: plan.id.clone(),
+                    unit_id: item.unit_id.clone(),
+                    provider: item.provider.clone(),
+                    original_locator: locator.clone(),
+                    action,
+                    outcome: CleanupOutcome::Pending,
+                    reclaimed_bytes: 0,
+                    reason: Some("execution intent; final result not recorded yet".into()),
+                };
+                if let Err(error) = audit.record(&intent) {
+                    audit_failure = Some(error.to_string());
+                    results.push(CleanupItemOutcome {
+                        unit_id: item.unit_id.clone(),
+                        outcome: CleanupOutcome::Failed,
+                        reclaimed_bytes: 0,
+                        reason: Some(format!("audit intent failed before mutation: {error}")),
+                    });
+                    continue;
+                }
+            }
 
             // Execute: each action type has its own executor.
             //
@@ -727,49 +918,63 @@ impl Application {
             //   `docs/safety/provider-operation.md`, `Start.md` §12.4).
             //   Providers that have not opted in keep the legacy
             //   `Failed("not supported")` default. Provider-specific
-            //   decisions (Codex's native-CLI-first + §12.4 fallback,
-            //   for example) live inside the provider, not here —
+            //   protocol/version gates live inside the provider, not here —
             //   Application stays policy-only, no per-provider logic
             //   (red line #2).
-            let (outcome, reclaimed_bytes, reason) = match action {
-                CleanupAction::Trash => {
-                    let paths: Vec<PathBuf> = item.locator.paths().into_iter().cloned().collect();
-                    aggregate_trash_results(
-                        &trash::move_paths_to_trash(&paths),
-                        item.estimated_reclaimable_bytes,
+            let (outcome, reclaimed_bytes, reason) =
+                if revalidation.outcome != CleanupOutcome::Pending {
+                    (revalidation.outcome, 0, revalidation.reason)
+                } else if plan_expired(plan, now_ms()) {
+                    (
+                        CleanupOutcome::Skipped,
+                        0,
+                        Some("plan expired while revalidating — rescan".into()),
                     )
-                }
-                CleanupAction::ProviderOperation => {
-                    let provider = self.providers.get(&item.provider).ok_or_else(|| {
-                        anyhow::anyhow!("no registered adapter for provider {:?}", item.provider)
-                    })?;
-                    let installation =
-                        self.installation_for(&item.installation_id)
-                            .ok_or_else(|| {
+                } else {
+                    match action {
+                        CleanupAction::Trash => {
+                            let paths: Vec<PathBuf> =
+                                item.locator.paths().into_iter().cloned().collect();
+                            aggregate_trash_results(&trash::move_paths_to_trash(&paths))
+                        }
+                        CleanupAction::ProviderOperation => {
+                            let provider = self.providers.get(&item.provider).ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "no installation registered for id {:?}",
-                                    item.installation_id
+                                    "no registered adapter for provider {:?}",
+                                    item.provider
                                 )
                             })?;
-                    match provider
-                        .execute_provider_operation(item, &installation)
-                        .await
-                    {
-                        Ok(outcome) => (outcome.outcome, outcome.reclaimed_bytes, outcome.reason),
-                        Err(error) => (
-                            CleanupOutcome::Failed,
-                            0,
-                            Some(format!("provider operation failed: {error}")),
-                        ),
+                            // Resolve fresh detection facts in this request. No state
+                            // from cleanup_preview is needed by this Application instance.
+                            let installation = installations
+                                .iter()
+                                .find(|installation| {
+                                    installation.id == item.installation_id
+                                        && installation.provider == item.provider
+                                })
+                                .ok_or_else(|| anyhow::anyhow!("installation vanished"))?;
+                            match provider
+                                .execute_provider_operation(item, installation)
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    (outcome.outcome, outcome.reclaimed_bytes, outcome.reason)
+                                }
+                                Err(error) => (
+                                    CleanupOutcome::Failed,
+                                    0,
+                                    Some(format!("provider operation failed: {error}")),
+                                ),
+                            }
+                        }
                     }
-                }
-            };
+                };
 
-            // Audit log entry — best-effort; a log failure aborts this item
-            // so the report stays uniform.
+            // The synced intent remains available after a crash. A result
+            // write failure stops the batch; never hide a completed mutation.
             let event = CleanupEvent {
                 schema_version: CleanupEvent::SCHEMA_VERSION.into(),
-                platform: host_platform(),
+                platform: agenttidy_infrastructure::paths::host_platform(),
                 timestamp_ms: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -783,12 +988,13 @@ impl Application {
                 reclaimed_bytes,
                 reason: reason.clone(),
             };
-            if let Err(error) = audit_log::record(&event) {
+            if let Err(error) = audit.record(&event) {
+                audit_failure = Some(error.to_string());
                 results.push(CleanupItemOutcome {
                     unit_id: item.unit_id.clone(),
                     outcome: CleanupOutcome::Failed,
                     reclaimed_bytes: 0,
-                    reason: Some(format!("audit log write failed: {error}")),
+                    reason: Some(format!("operation outcome was {outcome:?}; audit result write failed: {error}; batch stopped")),
                 });
                 continue;
             }
@@ -801,6 +1007,119 @@ impl Application {
         }
         Ok(results)
     }
+}
+
+/// Admit at most one selected operation per physical database (§12.2).
+/// Resolve live paths rather than trusting caller-supplied canonical evidence;
+/// aliases must not circumvent the single-database-operation restriction.
+fn validate_database_batch(plan: &CleanupPlan, selected: &[String]) -> anyhow::Result<()> {
+    let mut databases = std::collections::BTreeSet::new();
+    for item in &plan.items {
+        if !selected.contains(&item.unit_id) {
+            continue;
+        }
+        if let agenttidy_core::CleanupLocator::DbRow { database, .. } = &item.locator {
+            let canonical = safe_canonicalize(database)?;
+            let identity = agenttidy_infrastructure::fs_probe::file_identity(&canonical)
+                .ok_or_else(|| anyhow::anyhow!("cannot identify selected database"))?;
+            anyhow::ensure!(databases.insert((identity.volume, identity.index)),
+                "multiple selected operations share a database; select one database session per fresh preview until coordinated database batches are supported (§12.2)");
+        }
+    }
+    Ok(())
+}
+
+/// Capture metadata for every member without following links (§12.2 / §16.1).
+/// A directory's children are part of the reviewed unit, not an untracked
+/// attachment that can change between the two confirmations.
+fn cleanup_evidence(
+    unit: &CleanupUnit,
+    inspection: &ProviderInspection,
+    snapshot: &AgentSnapshot,
+) -> anyhow::Result<CleanupEvidence> {
+    let mut evidence = CleanupEvidence {
+        provider_version: inspection.version.clone(),
+        schema_versions: inspection.schema_versions.clone(),
+        journal_modes: inspection.journal_modes.clone(),
+        ..CleanupEvidence::default()
+    };
+    let mut roots: Vec<PathBuf> = unit.locator.paths().into_iter().cloned().collect();
+    // A DB operation still belongs to a transcript resource. Retain its
+    // metadata too so a rollout-only update cannot escape revalidation.
+    for reference in &unit.resources {
+        let resource = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.id == reference.id)
+            .ok_or_else(|| anyhow::anyhow!("cleanup resource disappeared"))?;
+        match &resource.locator {
+            agenttidy_core::ResourceLocator::File { path }
+            | agenttidy_core::ResourceLocator::Dir { path } => roots.push(PathBuf::from(path)),
+            agenttidy_core::ResourceLocator::FileSet { paths } => {
+                roots.extend(paths.iter().map(PathBuf::from))
+            }
+            agenttidy_core::ResourceLocator::DatabaseRecord { database, .. } => {
+                roots.push(PathBuf::from(database))
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    // WAL changes do not necessarily change the main database's mtime.
+    // Include existing SQLite sidecars and their membership in the evidence.
+    if let agenttidy_core::CleanupLocator::DbRow { database, .. } = &unit.locator {
+        for suffix in ["-wal", "-shm"] {
+            let mut path = database.as_os_str().to_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            if path.symlink_metadata().is_ok() {
+                roots.push(path);
+            }
+        }
+    }
+    anyhow::ensure!(!roots.is_empty(), "empty cleanup locator");
+    let mut members = BTreeMap::new();
+    for root in roots {
+        let walked = walk_tree(&root);
+        anyhow::ensure!(
+            walked.problems.is_empty() && !walked.entries.is_empty(),
+            "cannot inspect complete unit at {}",
+            root.display()
+        );
+        for entry in walked.entries {
+            anyhow::ensure!(
+                matches!(entry.kind, EntryKind::File | EntryKind::Dir),
+                "link or unknown entry in cleanup unit: {}",
+                entry.path.display()
+            );
+            let canonical = safe_canonicalize(&entry.path)?;
+            evidence
+                .canonical_paths
+                .insert(entry.path.clone(), canonical);
+            let identity = entry
+                .identity
+                .or_else(|| agenttidy_infrastructure::fs_probe::file_identity(&entry.path))
+                .ok_or_else(|| anyhow::anyhow!("cannot fingerprint {}", entry.path.display()))?;
+            let modified = std::fs::symlink_metadata(&entry.path)?
+                .modified()?
+                .duration_since(UNIX_EPOCH)?
+                .as_millis() as i64;
+            members.insert(
+                entry.path.clone(),
+                agenttidy_core::ResourceFingerprint {
+                    path: entry.path,
+                    identity: agenttidy_core::FileIdentity {
+                        volume: identity.volume,
+                        index: identity.index,
+                    },
+                    size_bytes: entry.logical_len,
+                    mtime_ms: modified,
+                },
+            );
+        }
+    }
+    evidence.members = members.into_values().collect();
+    Ok(evidence)
 }
 
 /// §12.2 plan TTL: once `expires_at` passes the plan is uniformly stale
@@ -829,23 +1148,23 @@ fn plan_fingerprint(
     items: &[CleanupItem],
     total_reclaimable_bytes: u64,
     risk_summary: &RiskSummary,
+    created_at: u64,
+    expires_at: Option<u64>,
 ) -> String {
     use sha2::{Digest, Sha256};
-    let mut unit_ids: Vec<&str> = items.iter().map(|i| i.unit_id.as_str()).collect();
-    unit_ids.sort();
     let mut hasher = Sha256::new();
-    hasher.update(plan_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(scan_id.as_bytes());
-    hasher.update(b"\n");
-    for id in unit_ids {
-        hasher.update(id.as_bytes());
-        hasher.update(b"\n");
-    }
-    hasher.update(total_reclaimable_bytes.to_le_bytes());
-    hasher.update(b"\n");
-    let summary_json = serde_json::to_string(risk_summary).unwrap_or_default();
-    hasher.update(summary_json.as_bytes());
+    let payload = (
+        plan_id,
+        scan_id,
+        items,
+        total_reclaimable_bytes,
+        risk_summary,
+        created_at,
+        expires_at,
+    );
+    // Domain structs have infallible JSON serialization; never hash a
+    // fallback empty string that could make distinct plans look identical.
+    hasher.update(serde_json::to_vec(&payload).expect("cleanup plan serializes"));
     let digest = hasher.finalize();
     format!("{:x}", digest)
 }
@@ -863,9 +1182,8 @@ fn scan_id_for(snapshots: &[AgentSnapshot]) -> String {
 /// Aggregate per-path trash results into one §12.3 item outcome.
 /// Pure, so the partial-failure rules are unit-testable without a real
 /// trash service (which is environment-dependent — see `trash.rs`).
-/// `estimated` is the unit's reclaim estimate, recorded only when at
-/// least one member actually moved; `AlreadyGone` / `NotFound` count as
-/// idempotent no-ops, never as fresh success.
+/// A Trash move is not physical disk reclamation; actual freed bytes stay
+/// zero. `AlreadyGone` / `NotFound` are idempotent skips, never fresh success.
 ///
 /// Lock classification (`docs/safety/session-transcript-fileset.md`
 /// Concurrency): members held open by another process report `Locked`.
@@ -874,10 +1192,7 @@ fn scan_id_for(snapshots: &[AgentSnapshot]) -> String {
 /// non-locked failure, or a lock that arrives *after* some members
 /// already moved, keeps the honest `Failed`: a partial FileSet is not
 /// the measured unit and must never look like a clean skip.
-fn aggregate_trash_results(
-    results: &[PathTrashResult],
-    estimated: u64,
-) -> (CleanupOutcome, u64, Option<String>) {
+fn aggregate_trash_results(results: &[PathTrashResult]) -> (CleanupOutcome, u64, Option<String>) {
     let mut removed = 0usize;
     let mut locked: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
@@ -937,7 +1252,8 @@ fn aggregate_trash_results(
         );
     }
     if removed > 0 {
-        (CleanupOutcome::Removed, estimated, None)
+        (CleanupOutcome::Removed, 0,
+            Some("moved to system Trash; this does not free disk space until Trash is emptied manually".into()))
     } else {
         (
             CleanupOutcome::Skipped,
@@ -1073,27 +1389,14 @@ fn revalidate_item(
     }
 }
 
-/// Resolve the host platform at compile time. Keeps the audit-log
-/// writer free of platform branching (red line #11).
-fn host_platform() -> CorePlatform {
-    #[cfg(windows)]
-    {
-        CorePlatform::Windows
-    }
-    #[cfg(not(windows))]
-    {
-        CorePlatform::Macos
-    }
-}
-
-/// Extension on `ProviderInspection` — the upstream type does not derive
-/// `Default`, so we provide a no-facts fallback the policy uses when an
-/// installation's inspection has not been recorded (e.g. an empty
-/// provider that returns no installations).
+/// Empty inspection for deterministic unit tests, never a production
+/// substitute for missing safety facts (§12.2 fail-closed).
+#[cfg(test)]
 trait ProviderInspectionExt {
     fn empty_for_testing() -> Self;
 }
 
+#[cfg(test)]
 impl ProviderInspectionExt for ProviderInspection {
     fn empty_for_testing() -> Self {
         Self {
@@ -1147,7 +1450,7 @@ mod tests {
             (PathBuf::from("/tmp/a.jsonl"), Ok(TrashOutcome::Locked)),
             (PathBuf::from("/tmp/a"), Ok(TrashOutcome::Locked)),
         ];
-        let (outcome, bytes, reason) = aggregate_trash_results(&locked_only, 100);
+        let (outcome, bytes, reason) = aggregate_trash_results(&locked_only);
         assert_eq!(outcome, CleanupOutcome::Skipped);
         assert_eq!(bytes, 0);
         let reason = reason.expect("locked skip carries a reason");
@@ -1162,7 +1465,7 @@ mod tests {
             (PathBuf::from("/tmp/b.jsonl"), Ok(TrashOutcome::Removed)),
             (PathBuf::from("/tmp/b"), Ok(TrashOutcome::Locked)),
         ];
-        let (outcome, bytes, reason) = aggregate_trash_results(&partial, 100);
+        let (outcome, bytes, reason) = aggregate_trash_results(&partial);
         assert_eq!(outcome, CleanupOutcome::Failed);
         assert_eq!(bytes, 0);
         assert!(
@@ -1650,9 +1953,8 @@ mod tests {
 
     #[tokio::test]
     async fn plan_from_empty_provider_snapshots_is_empty_and_fingerprinted() {
-        // Phase 6 ships framework-only: no provider emits units yet, so
-        // the typed plan is empty but structurally complete (id, TTL,
-        // fingerprint) — the GUI renders the empty Review view from it.
+        // An empty installation set still yields a complete preview contract
+        // (id, TTL, fingerprint), regardless of which providers are enabled.
         let app = Application::new();
         let plan = app
             .cleanup_plan_from_snapshots(&[])
@@ -1690,6 +1992,7 @@ mod tests {
     async fn expired_plan_is_skipped_at_revalidate_and_rejected_at_execute() {
         let app = Application::new();
         let item = CleanupItem {
+            evidence: Default::default(),
             unit_id: "unit-expired".into(),
             installation_id: "claude-code:cli".into(),
             provider: ProviderId::new(ProviderId::CLAUDE_CODE),
@@ -1774,6 +2077,7 @@ mod tests {
             .unwrap_or(0);
 
         let item = CleanupItem {
+            evidence: Default::default(),
             unit_id: "unit-size-change".into(),
             installation_id: "codex:default".into(),
             provider: ProviderId::new(ProviderId::CODEX),
@@ -1817,6 +2121,7 @@ mod tests {
                 .as_nanos()
         ));
         let item = CleanupItem {
+            evidence: Default::default(),
             unit_id: "unit-gone".into(),
             installation_id: "codex:default".into(),
             provider: ProviderId::new(ProviderId::CODEX),
@@ -1858,6 +2163,7 @@ mod tests {
         ));
         std::fs::write(&file, b"data").unwrap();
         let item = CleanupItem {
+            evidence: Default::default(),
             unit_id: "unit-agent-running".into(),
             installation_id: "codex:default".into(),
             provider: ProviderId::new(ProviderId::CODEX),
@@ -1913,6 +2219,7 @@ mod tests {
         let real_identity =
             agenttidy_infrastructure::fs_probe::file_identity(&file).expect("file identity");
         let item = CleanupItem {
+            evidence: Default::default(),
             unit_id: "unit-ok".into(),
             installation_id: "codex:default".into(),
             provider: ProviderId::new(ProviderId::CODEX),
@@ -1966,6 +2273,7 @@ mod tests {
             agenttidy_infrastructure::fs_probe::file_identity(&transcript).expect("identity");
         let gone_side_dir = dir.join("t"); // deliberately never created
         let item = CleanupItem {
+            evidence: Default::default(),
             unit_id: "unit-fileset-member".into(),
             installation_id: "claude-code:cli".into(),
             provider: ProviderId::new(ProviderId::CLAUDE_CODE),
@@ -2005,15 +2313,15 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn aggregate_all_removed_reports_estimate() {
+    fn aggregate_all_removed_does_not_claim_physical_disk_reclamation() {
         let results: Vec<PathTrashResult> = vec![
             (PathBuf::from("/a"), Ok(TrashOutcome::Removed)),
             (PathBuf::from("/b"), Ok(TrashOutcome::Removed)),
         ];
-        let (outcome, reclaimed, reason) = aggregate_trash_results(&results, 4096);
+        let (outcome, reclaimed, reason) = aggregate_trash_results(&results);
         assert_eq!(outcome, CleanupOutcome::Removed);
-        assert_eq!(reclaimed, 4096);
-        assert_eq!(reason, None);
+        assert_eq!(reclaimed, 0);
+        assert!(reason.unwrap().contains("does not free disk space"));
     }
 
     #[test]
@@ -2026,7 +2334,7 @@ mod tests {
                 Err(TrashError::NotFound(PathBuf::from("/b"))),
             ),
         ];
-        let (outcome, reclaimed, reason) = aggregate_trash_results(&results, 4096);
+        let (outcome, reclaimed, reason) = aggregate_trash_results(&results);
         assert_eq!(outcome, CleanupOutcome::Skipped);
         assert_eq!(reclaimed, 0);
         assert!(reason.unwrap().contains("already gone"));
@@ -2043,7 +2351,7 @@ mod tests {
                 Ok(TrashOutcome::PlatformError("locked".into())),
             ),
         ];
-        let (outcome, reclaimed, reason) = aggregate_trash_results(&results, 4096);
+        let (outcome, reclaimed, reason) = aggregate_trash_results(&results);
         assert_eq!(outcome, CleanupOutcome::Failed);
         assert_eq!(reclaimed, 0);
         let reason = reason.unwrap();
@@ -2055,300 +2363,7 @@ mod tests {
     // End-to-end execute (§12.1 guard → §12.3 outcomes → §16.3 audit).
     // -----------------------------------------------------------------
 
-    /// Executes one FileSet item end-to-end with HOME/USERPROFILE
-    /// redirected into the temp dir so the §12.1 guard lock and §16.3
-    /// audit log never touch the real user profile (same isolation
-    /// pattern as the audit-log tests). The native trash is
-    /// environment-dependent (headless macOS has no Finder service), so
-    /// the outcome assertion accepts Removed or Failed — the audit row
-    /// must exist either way.
-    #[tokio::test]
-    async fn execute_trashes_fileset_item_and_writes_audit_row() {
-        // Env-mutating + guard-acquiring test — serialize against the
-        // ProviderOperation dispatch test (see EXECUTE_ENV_MUTEX).
-        let _env = EXECUTE_ENV_MUTEX.lock().await;
-        let dir = std::env::temp_dir().join(format!(
-            "agenttidy-execute-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let transcript = dir.join("t.jsonl");
-        let side_dir = dir.join("t");
-        std::fs::write(&transcript, b"body").unwrap();
-        std::fs::create_dir(&side_dir).unwrap();
-        let metadata = std::fs::symlink_metadata(&transcript).unwrap();
-        let mtime_ms = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let real_identity =
-            agenttidy_infrastructure::fs_probe::file_identity(&transcript).expect("identity");
-
-        // Isolate the per-user state dir (guard lock + audit log).
-        let home = dir.join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let previous_home = std::env::var_os("HOME");
-        let previous_user_profile = std::env::var_os("USERPROFILE");
-        std::env::set_var("HOME", &home);
-        std::env::set_var("USERPROFILE", &home);
-
-        let item = CleanupItem {
-            unit_id: "unit-e2e".into(),
-            installation_id: "claude-code:cli".into(),
-            provider: ProviderId::new(ProviderId::CLAUDE_CODE),
-            fingerprint: ResourceFingerprint {
-                path: transcript.clone(),
-                identity: FileIdentity {
-                    volume: real_identity.volume,
-                    index: real_identity.index,
-                },
-                size_bytes: 4,
-                mtime_ms,
-            },
-            locator: CleanupLocator::FileSet {
-                paths: vec![transcript.clone(), side_dir.clone()],
-            },
-            estimated_reclaimable_bytes: 4,
-            action: CleanupAction::Trash,
-            risk: RiskLevel::ReviewRequired,
-            reasons: vec![],
-            preconditions: vec![],
-        };
-        let plan = CleanupPlan {
-            id: "plan-e2e".into(),
-            scan_id: "scan-e2e".into(),
-            created_at: 0,
-            expires_at: None,
-            items: vec![item.clone()],
-            total_reclaimable_bytes: 4,
-            risk_summary: RiskSummary::default(),
-            fingerprint: "fingerprint-e2e".into(),
-        };
-
-        let app = Application::new();
-        let results = app
-            .cleanup_execute(
-                &plan,
-                &plan.fingerprint,
-                std::slice::from_ref(&item.unit_id),
-            )
-            .await
-            .expect("execute succeeds");
-        assert_eq!(results.len(), 1);
-        assert!(
-            matches!(
-                results[0].outcome,
-                CleanupOutcome::Removed | CleanupOutcome::Failed
-            ),
-            "unexpected outcome: {:?}",
-            results[0]
-        );
-
-        // §16.3: one audit row per item regardless of trash availability.
-        let audit_path = agenttidy_infrastructure::audit_log::audit_log_path().expect("audit path");
-        let events =
-            agenttidy_infrastructure::audit_log::read_all(&audit_path).expect("audit rows");
-        assert!(events.iter().any(|event| event.unit_id == "unit-e2e"));
-
-        // §12.3 idempotency: a re-run never reports a fresh success —
-        // the members are gone, so revalidation skips with PathExists.
-        let rerun = app
-            .cleanup_execute(
-                &plan,
-                &plan.fingerprint,
-                std::slice::from_ref(&item.unit_id),
-            )
-            .await
-            .expect("re-run succeeds");
-        assert_eq!(rerun[0].outcome, CleanupOutcome::Skipped);
-
-        // Restore the real home and clean up whatever the trash missed.
-        match previous_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match previous_user_profile {
-            Some(value) => std::env::set_var("USERPROFILE", value),
-            None => std::env::remove_var("USERPROFILE"),
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// `CleanupAction::ProviderOperation` is routed through each
-    /// provider's `execute_provider_operation` trait method (Phase 7
-    /// commit 5: Codex overrides; Claude Code and WorkBuddy keep the
-    /// default `Failed("not supported")`). This test pins the
-    /// dispatch contract at the application layer: the item must
-    /// reach the *real* Codex override, which fail-closes on the
-    /// bogus fixture database (an empty file, not a SQLite DB) and
-    /// reports `Failed` with a provider-sourced reason.
-    #[tokio::test]
-    async fn execute_provider_operation_routes_to_adapter_default_failed() {
-        use agenttidy_core::cleanup::{
-            CleanupAction, CleanupItem, CleanupLocator, FileIdentity, ResourceFingerprint,
-            RiskLevel,
-        };
-        use agenttidy_core::provider::ProviderId;
-
-        // Env-mutating + guard-acquiring test — serialize against the
-        // FileSet trash test (see EXECUTE_ENV_MUTEX).
-        let _env = EXECUTE_ENV_MUTEX.lock().await;
-
-        // Use the same fake-HOME / fake-USERPROFILE isolation as the
-        // Trash test so the audit log writes to a temp dir rather than
-        // touching the real user profile.
-        let audit_root = std::env::temp_dir().join(format!(
-            "agenttidy-execute-providerop-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&audit_root).unwrap();
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &audit_root);
-        // Point PATH at the empty dir *plus the system dirs* so the
-        // Codex override's native-CLI probe finds no binary and goes
-        // straight to the §12.4 self-implementation — while the
-        // macOS trash helper's `osascript` (resolved via PATH, and
-        // used by the concurrent FileSet trash test) keeps working.
-        // (`codex` itself lives under ~/.nvm or /opt/homebrew, never
-        // /usr/bin, so the probe still misses.)
-        let empty_path = std::env::temp_dir().join(format!(
-            "agenttidy-empty-path-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&empty_path).unwrap();
-        let previous_path = std::env::var("PATH").ok();
-        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", empty_path.display()));
-
-        // Revalidation walks the fingerprint path, so create a real
-        // (empty) file the executor can stat. We are not testing the
-        // SQL layer here — only the dispatch table.
-        let db_path = audit_root.join("state_5.sqlite");
-        std::fs::write(&db_path, b"").unwrap();
-        let metadata = std::fs::symlink_metadata(&db_path).unwrap();
-        let mtime_ms = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let identity = agenttidy_infrastructure::fs_probe::file_identity(&db_path)
-            .expect("identity for empty db");
-
-        let app = Application::new();
-
-        // Build a minimal plan by hand: one ProviderOperation item
-        // (no scan needed — we exercise the dispatch table directly).
-        let item = CleanupItem {
-            unit_id: "codex:row:demo".into(),
-            installation_id: "codex:default".into(),
-            provider: ProviderId::new(ProviderId::CODEX),
-            fingerprint: ResourceFingerprint {
-                path: db_path.clone(),
-                identity: FileIdentity {
-                    volume: identity.volume,
-                    index: identity.index,
-                },
-                size_bytes: metadata.len(),
-                mtime_ms,
-            },
-            locator: CleanupLocator::DbRow {
-                database: db_path.clone(),
-                record_id: "demo-thread".into(),
-            },
-            estimated_reclaimable_bytes: 0,
-            action: CleanupAction::ProviderOperation,
-            risk: RiskLevel::ReviewRequired,
-            reasons: vec![],
-            preconditions: vec![],
-        };
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let plan = CleanupPlan {
-            id: format!("{:016x}{:08x}", now_ms, 1),
-            scan_id: "test".into(),
-            created_at: now_ms,
-            expires_at: Some(now_ms + 5 * 60 * 1000),
-            items: vec![item.clone()],
-            total_reclaimable_bytes: 0,
-            risk_summary: RiskSummary::default(),
-            fingerprint: "test-fingerprint".into(),
-        };
-
-        // Cache the installation referenced by the item so the
-        // executor can resolve it (mirrors what
-        // `cleanup_plan_from_snapshots` does on the real path).
-        let installation = AgentInstallation {
-            id: "codex:default".into(),
-            provider: ProviderId::new(ProviderId::CODEX),
-            platform: agenttidy_core::installation::Platform::Macos,
-            version: None,
-            data_roots: vec![audit_root.to_string_lossy().into_owned()],
-            status: agenttidy_core::installation::InstallationStatus::Available,
-        };
-        app.remember_installations(&[AgentSnapshot {
-            installation,
-            sessions: Vec::new(),
-            resources: Vec::new(),
-            problems: BTreeMap::new(),
-            completed_at: now_ms,
-        }]);
-
-        let results = app
-            .cleanup_execute(
-                &plan,
-                &plan.fingerprint,
-                std::slice::from_ref(&item.unit_id),
-            )
-            .await
-            .expect("executor dispatches ProviderOperation through adapter");
-
-        assert_eq!(results.len(), 1);
-        // The fixture `state_5.sqlite` is an empty file, not a real
-        // database: the Codex adapter's backup step fails-closed and
-        // reports `Failed` — proving the dispatch reached the real
-        // adapter override (Phase 7 commit 5) rather than the trait's
-        // default "not supported" stub.
-        assert_eq!(
-            results[0].outcome,
-            CleanupOutcome::Failed,
-            "bogus fixture DB must fail the Codex provider operation"
-        );
-        assert_eq!(results[0].reclaimed_bytes, 0);
-        assert!(
-            !results[0]
-                .reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("not supported"),
-            "reason must come from the Codex override, not the trait default stub"
-        );
-
-        // Cleanup fake HOME + PATH.
-        match previous_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match previous_path {
-            Some(value) => std::env::set_var("PATH", value),
-            None => std::env::remove_var("PATH"),
-        }
-        std::fs::remove_dir_all(&audit_root).ok();
-        std::fs::remove_dir_all(&empty_path).ok();
-    }
+    // Tests for fresh IPC instances and execution-time safety use a deterministic
+    // provider, so real running agents never mask a dispatch regression (§18).
+    mod live;
 }

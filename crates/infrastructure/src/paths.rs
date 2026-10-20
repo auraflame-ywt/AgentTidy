@@ -47,6 +47,19 @@ pub fn home_dir() -> Option<PathBuf> {
     }
 }
 
+/// Host platform for shared audit metadata. Platform selection belongs in
+/// infrastructure, never in the Application's policy/execution code (§22).
+pub fn host_platform() -> agenttidy_core::Platform {
+    #[cfg(windows)]
+    {
+        agenttidy_core::Platform::Windows
+    }
+    #[cfg(not(windows))]
+    {
+        agenttidy_core::Platform::Macos
+    }
+}
+
 /// Canonicalize for safety-critical use (§16.1 "all paths canonicalize
 /// before execution").
 ///

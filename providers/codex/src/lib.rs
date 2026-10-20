@@ -14,11 +14,10 @@ use agenttidy_core::{
     ResourceFingerprint, ResourceId, ResourceKind, ResourceLocator, ResourceRef, ScanOptions,
     ScanProblem, Session, SessionId, SessionLifecycle, SizeConfidence, SizeInfo,
 };
-use agenttidy_infrastructure::backup::backup_sqlite_with_sidecars;
 use agenttidy_infrastructure::disk_usage::UsageAccumulator;
 use agenttidy_infrastructure::fs_probe::{file_identity, walk_tree, EntryKind, WalkProblem};
 use agenttidy_infrastructure::processes::{any_process_running, ProcessSignature};
-use agenttidy_infrastructure::sqlite::{MutableSqliteDb, ReadOnlyDb};
+use agenttidy_infrastructure::sqlite::ReadOnlyDb;
 use agenttidy_infrastructure::workspace_safety::inspect_workspace_safety;
 use agenttidy_provider_api::{AgentProviderAdapter, ProviderInspection};
 use std::collections::{BTreeMap, HashSet};
@@ -29,6 +28,11 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const INSTALLATION_ID: &str = "codex:default";
+
+// A version/help probe cannot establish recovery of the complete consistency
+// set. Keep both preview and direct adapter execution closed until §16.4
+// acceptance covers transcripts, index, attachments and both databases.
+const RECOVERY_BLOCKER: &str = "Codex cleanup disabled: complete session recovery has not been validated (databases, transcript, index and attachments; §16.4)";
 
 /// Adapter for the single Codex installation shared by its CLI and desktop
 /// application. Both products write to the same state root (§ Phase 0 docs).
@@ -242,12 +246,14 @@ impl CodexAdapter {
                 id,
                 ThreadIndex {
                     rollout_path: row.get(1).map_err(|error| error.to_string())?,
-                    created_at: epoch_ms(row.get(2).map_err(|error| error.to_string())?),
-                    updated_at: epoch_ms(row.get(3).map_err(|error| error.to_string())?),
+                    created_at: epoch_seconds_to_ms(row.get(2).map_err(|error| error.to_string())?),
+                    updated_at: epoch_seconds_to_ms(row.get(3).map_err(|error| error.to_string())?),
                     cwd: row.get(4).map_err(|error| error.to_string())?,
                     title: row.get(5).map_err(|error| error.to_string())?,
                     archived: archived.unwrap_or_default() != 0,
-                    archived_at: epoch_ms(row.get(7).map_err(|error| error.to_string())?),
+                    archived_at: epoch_seconds_to_ms(
+                        row.get(7).map_err(|error| error.to_string())?,
+                    ),
                     cli_version: row.get(8).map_err(|error| error.to_string())?,
                     source: row.get(9).map_err(|error| error.to_string())?,
                     thread_source: row.get(10).map_err(|error| error.to_string())?,
@@ -435,10 +441,13 @@ struct ThreadIndex {
     originator: Option<String>,
 }
 
-/// SQLite timestamps are signed integers; negative values are not valid epoch
-/// milliseconds for this domain and must not be reinterpreted as huge u64s.
-fn epoch_ms(value: Option<i64>) -> Option<u64> {
-    value.and_then(|value| u64::try_from(value).ok())
+/// The investigated threads.created_at/updated_at/archived_at columns are
+/// Unix seconds (docs/providers/codex.md), while the domain uses milliseconds.
+/// Convert once at the boundary; negative or overflowing epochs remain unknown.
+fn epoch_seconds_to_ms(value: Option<i64>) -> Option<u64> {
+    value
+        .and_then(|value| u64::try_from(value).ok())
+        .and_then(|value| value.checked_mul(1000))
 }
 
 fn string_field(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
@@ -494,6 +503,23 @@ impl AgentProviderAdapter for CodexAdapter {
             .collect();
         let state_root = installation.data_roots.first().map(PathBuf::from);
         let mut problems = BTreeMap::new();
+        problems.insert(
+            "codex-cleanup-recovery-unverified".into(),
+            ScanProblem::Warning {
+                message: RECOVERY_BLOCKER.into(),
+            },
+        );
+        let version = if let Some(root) = &state_root {
+            match probe_native_cli(native_codex_command(root)).await {
+                Ok(version) => Some(version),
+                Err(message) => {
+                    problems.insert("codex-cleanup-cli".into(), ScanProblem::Warning { message });
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut schema_versions: BTreeMap<String, String> = BTreeMap::new();
         let mut journal_modes: BTreeMap<String, String> = BTreeMap::new();
         if let Some(root) = &state_root {
@@ -515,13 +541,30 @@ impl AgentProviderAdapter for CodexAdapter {
                 }) {
                     schema_versions.insert("state_5".into(), version);
                 }
+                if let Ok(mut statement) = db.connection().prepare(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name",
+                ) {
+                    if let Ok(rows) = statement.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    }) {
+                        if let Ok(schema) = rows.collect::<Result<Vec<_>, _>>() {
+                            schema_versions
+                                .insert("state_5.schema".into(), serde_json::to_string(&schema)?);
+                        }
+                    }
+                }
                 if let Ok(mode) = db.journal_mode() {
                     journal_modes.insert("state_5".into(), mode);
                 }
             }
         }
         Ok(ProviderInspection {
-            version: installation.version.clone(),
+            version,
             schema_versions,
             journal_modes,
             agent_running: Self::running(),
@@ -661,15 +704,10 @@ impl AgentProviderAdapter for CodexAdapter {
         })
     }
 
-    /// Phase 7 beta: each archived, exclusively-owned session resource
-    /// emits one `ProviderOperation` unit whose `record_id` is the
-    /// session UUID and whose `database` is the `state_5.sqlite`
-    /// path. Trashing the rollout JSONL alone would orphan the
-    /// authoritative thread rows; the executor must coordinate
-    /// the JSONL path + DB rows + projection rows + index line as
-    /// one atomic transaction (`docs/safety/provider-operation.md`,
-    /// `Start.md` §12.4). Red lines #7 + #8 are what make this a
-    /// `ProviderOperation` and not a `Trash` slice.
+    /// Describe archived, exclusively-owned candidates as DB-owned units
+    /// (§9.5 / §12.4). Trashing JSONL alone would orphan authoritative rows.
+    /// These candidates remain visible but Blocked until native success and
+    /// complete recovery pass docs/safety/provider-operation.md acceptance.
     async fn build_cleanup_units(
         &self,
         snapshot: &AgentSnapshot,
@@ -708,14 +746,13 @@ impl AgentProviderAdapter for CodexAdapter {
             if !archived {
                 continue;
             }
-            let primary = match &resource.locator {
-                ResourceLocator::File { path } => PathBuf::from(path),
-                _ => continue,
-            };
-            let Ok(metadata) = std::fs::symlink_metadata(&primary) else {
+            if !matches!(resource.locator, ResourceLocator::File { .. }) {
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(&database) else {
                 continue;
             };
-            let Some(identity) = file_identity(&primary) else {
+            let Some(identity) = file_identity(&database) else {
                 continue;
             };
             let mtime_ms = metadata
@@ -761,7 +798,8 @@ impl AgentProviderAdapter for CodexAdapter {
     /// Validate a `ProviderOperation` unit: the `database` must
     /// canonicalize inside the installation's data roots, the
     /// `record_id` must be non-empty, and the session must still be
-    /// `Archived`. Returns the typed §12.2 preconditions.
+    /// `Archived`. Even structurally valid units fail the independent
+    /// recovery gate until complete §16.4 acceptance has been demonstrated.
     async fn validate_cleanup_unit(
         &self,
         unit: &CleanupUnit,
@@ -798,50 +836,50 @@ impl AgentProviderAdapter for CodexAdapter {
                 database.display()
             );
         }
-        Ok(unit.preconditions.clone())
+        let state_root = installation
+            .data_roots
+            .first()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("missing Codex state root"))?;
+        anyhow::ensure!(
+            canonical_db
+                == agenttidy_infrastructure::paths::safe_canonicalize(
+                    &state_root.join("state_5.sqlite")
+                )?,
+            "unexpected Codex database"
+        );
+        // A missing lock directory means no locks; an unreadable one cannot
+        // prove quiescence and must never be treated as empty (§16.2).
+        match fs::read_dir(state_root.join("thread-writer-locks")) {
+            Ok(mut entries) => {
+                anyhow::ensure!(entries.next().is_none(), "Codex writer lock present")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => anyhow::bail!("cannot inspect Codex writer locks: {error}"),
+        }
+        let index = Self::thread_index(&state_root)
+            .map_err(|error| anyhow::anyhow!("cannot verify Codex thread index: {error}"))?;
+        anyhow::ensure!(
+            index.get(record_id).is_some_and(|thread| thread.archived),
+            "Codex session is missing or no longer archived"
+        );
+        // Report CLI admission now, before the user reaches confirmation.
+        // Even an admitted CLI cannot bypass the independent recovery gate.
+        let cli_error = probe_native_cli(native_codex_command(&state_root))
+            .await
+            .err();
+        anyhow::bail!(cleanup_admission_reason(cli_error.as_deref()));
     }
 
-    /// Execute one Codex `ProviderOperation` unit. Preferred path is
-    /// `codex delete <record_id>` (verified against codex-cli
-    /// 0.152.0; `docs/providers/codex.md` Open Question closed). If
-    /// the binary is missing or the CLI exits non-zero, fall back
-    /// to the §12.4 self-implementation: backup → temp-copy →
-    /// `BEGIN IMMEDIATE` → coordinated DELETE → `wal_checkpoint` +
-    /// `quick_check` + `foreign_key_check` → `fs::rename` over the
-    /// agent's source → audit `reason` records the backup path.
-    ///
-    /// The `NoAgentRunning` precondition is enforced by the
-    /// application-layer revalidation pipeline (§12.2), not here —
-    /// the provider's job is to *execute* the mutation, not to
-    /// re-prove the freshness facts the policy already checked.
+    /// Defense in depth (§12.4 / §16.4): a direct adapter call must not
+    /// bypass the preview's recovery gate. No backup or native delete is
+    /// attempted while complete recovery remains unverified.
     async fn execute_provider_operation(
         &self,
         item: &agenttidy_core::cleanup::CleanupItem,
         _installation: &AgentInstallation,
     ) -> anyhow::Result<CleanupItemOutcome> {
-        let CleanupLocator::DbRow {
-            database,
-            record_id,
-        } = &item.locator
-        else {
-            return Ok(failed_outcome(
-                &item.unit_id,
-                "codex ProviderOperation requires a DbRow locator",
-            ));
-        };
-
-        match run_codex_delete(record_id) {
-            Ok(mut outcome) => {
-                outcome.unit_id = item.unit_id.clone();
-                Ok(outcome)
-            }
-            Err(native_error) => self.execute_provider_operation_self_implemented(
-                item,
-                database,
-                record_id,
-                &native_error.to_string(),
-            ),
-        }
+        Ok(failed_outcome(&item.unit_id, RECOVERY_BLOCKER))
     }
 }
 
@@ -873,158 +911,70 @@ impl CodexAdapter {
             },
         ]
     }
-
-    /// §12.4 self-implementation path: backup → temp copy →
-    /// transaction → FK check → atomic replace. Used when the
-    /// Codex CLI is unavailable, fails, or its behaviour is
-    /// undocumented.
-    fn execute_provider_operation_self_implemented(
-        &self,
-        item: &agenttidy_core::cleanup::CleanupItem,
-        database: &Path,
-        record_id: &str,
-        native_error: &str,
-    ) -> anyhow::Result<CleanupItemOutcome> {
-        // 1. Backup. §16.4 — recovery is from the SQLite backup, not
-        //    from the OS trash.
-        let backup_root = match agenttidy_infrastructure::paths::home_dir() {
-            Some(home) => home.join(".agenttidy").join("backup"),
-            None => std::env::temp_dir().join("agenttidy-backup"),
-        };
-        let file_stem = format!("codex-{record_id}-{}", plan_id_for(item));
-        let backup_path = match backup_sqlite_with_sidecars(database, &backup_root, &file_stem) {
-            Ok(path) => path,
-            Err(error) => {
-                return Ok(failed_outcome(
-                    &item.unit_id,
-                    format!("backup failed before mutation: {error}"),
-                ));
-            }
-        };
-
-        // 2. Temp-copy mutation.
-        let mut db = match MutableSqliteDb::open_mutable_on_temp_copy(database) {
-            Ok(db) => db,
-            Err(error) => {
-                return Ok(failed_outcome(
-                    &item.unit_id,
-                    format!(
-                        "could not open mutable temp copy: {error}; backup at {}",
-                        backup_path.display()
-                    ),
-                ));
-            }
-        };
-
-        // 3. BEGIN IMMEDIATE → DELETE → COMMIT.
-        let tx_result = (|| -> rusqlite::Result<()> {
-            let tx = db.connection_mut().transaction()?;
-            tx.execute(
-                "DELETE FROM threads WHERE id = ?1",
-                rusqlite::params![record_id],
-            )?;
-            tx.execute(
-                "DELETE FROM thread_attachments WHERE thread_id = ?1",
-                rusqlite::params![record_id],
-            )?;
-            tx.execute(
-                "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ?1 OR child_thread_id = ?1",
-                rusqlite::params![record_id],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })();
-        if let Err(error) = tx_result {
-            return Ok(failed_outcome(
-                &item.unit_id,
-                format!(
-                    "DELETE transaction failed: {error}; backup at {}",
-                    backup_path.display()
-                ),
-            ));
-        }
-
-        // 4. `wal_checkpoint` + integrity gates.
-        let conn = db.connection();
-        if let Err(error) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
-            return Ok(failed_outcome(
-                &item.unit_id,
-                format!(
-                    "wal_checkpoint failed: {error}; backup at {}",
-                    backup_path.display()
-                ),
-            ));
-        }
-        let quick_ok: String = match conn.query_row("PRAGMA quick_check", [], |row| row.get(0)) {
-            Ok(value) => value,
-            Err(error) => {
-                return Ok(failed_outcome(
-                    &item.unit_id,
-                    format!(
-                        "quick_check pragma failed: {error}; backup at {}",
-                        backup_path.display()
-                    ),
-                ));
-            }
-        };
-        if !quick_ok.eq_ignore_ascii_case("ok") {
-            return Ok(failed_outcome(
-                &item.unit_id,
-                format!(
-                    "post-delete quick_check returned {quick_ok:?}; backup at {}",
-                    backup_path.display()
-                ),
-            ));
-        }
-
-        // 5. Atomic replace.
-        let temp_path = db.path().to_path_buf();
-        if let Err(error) = std::fs::rename(&temp_path, database) {
-            return Ok(failed_outcome(
-                &item.unit_id,
-                format!(
-                    "could not rename mutated DB over source: {error}; backup at {}",
-                    backup_path.display()
-                ),
-            ));
-        }
-        drop(db);
-
-        let reason = format!(
-            "codex self-implementation succeeded; native CLI unavailable ({native_error}); \
-             backup at {}",
-            backup_path.display()
-        );
-        Ok(CleanupItemOutcome {
-            unit_id: item.unit_id.clone(),
-            outcome: CleanupOutcome::Removed,
-            reclaimed_bytes: item.estimated_reclaimable_bytes,
-            reason: Some(reason),
-        })
-    }
 }
 
-/// Try to invoke `codex delete <record_id>` and translate the
-/// outcome into a `CleanupItemOutcome`. Non-zero exit ⇒ fall back to
-/// the self-implementation; missing binary ⇒ also fall back.
-fn run_codex_delete(record_id: &str) -> anyhow::Result<CleanupItemOutcome> {
-    let output = match Command::new("codex").arg("delete").arg(record_id).output() {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!("codex CLI not on PATH ({error})");
-        }
-        Err(error) => anyhow::bail!("failed to spawn codex delete: {error}"),
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        anyhow::bail!("codex delete exited with {}: {stderr}", output.status);
+/// Bind the read-only protocol probe to the detected installation, even
+/// when the shell has an unrelated CODEX_HOME override. No delete is enabled.
+fn native_codex_command(state_root: &Path) -> Command {
+    let mut command = Command::new("codex");
+    command.env("CODEX_HOME", state_root);
+    command
+}
+
+/// Only the version investigated in docs/providers/codex.md is admitted.
+/// CLI presence is a diagnostic fact, independent of recovery acceptance.
+fn parse_native_version(stdout: &[u8]) -> Result<String, String> {
+    let version = String::from_utf8_lossy(stdout).trim().to_string();
+    if version != "codex-cli 0.152.0" {
+        return Err(format!(
+            "Codex CLI unsupported: expected codex-cli 0.152.0, got {version}"
+        ));
     }
-    Ok(CleanupItemOutcome {
-        unit_id: String::new(),
-        outcome: CleanupOutcome::Removed,
-        reclaimed_bytes: 0,
-        reason: Some(format!("codex delete {record_id} succeeded via native CLI")),
-    })
+    Ok(version)
+}
+
+/// Read-only CLI admission for preview/diagnostics (§10.1 / §12.4).
+/// Taking an explicit command lets regressions exercise failures without
+/// changing process-global PATH or invoking an installed agent's delete.
+async fn probe_native_cli(mut command: Command) -> Result<String, String> {
+    command.arg("--version");
+    let output = bounded_cli_output(command, std::time::Duration::from_secs(3)).await?;
+    if !output.status.success() {
+        return Err(format!(
+            "Codex CLI unavailable: version probe exited with {}",
+            output.status
+        ));
+    }
+    parse_native_version(&output.stdout)
+}
+
+/// Bound launcher execution independently of its output protocol (§10.1).
+/// Dropping the timed-out output future kills the direct child and Tokio
+/// reaps it; no background probe may keep the desktop request waiting.
+async fn bounded_cli_output(
+    command: Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| "Codex CLI unavailable: version probe timed out".to_string())?
+        .map_err(|error| {
+            format!(
+                "Codex CLI unavailable: cannot run codex --version ({:?})",
+                error.kind()
+            )
+        })
+}
+
+/// Preserve both independent blockers instead of hiding an unavailable CLI
+/// behind the recovery gate, or implying that installing a CLI enables cleanup.
+fn cleanup_admission_reason(cli_error: Option<&str>) -> String {
+    match cli_error {
+        Some(error) => format!("{RECOVERY_BLOCKER}; {error}"),
+        None => RECOVERY_BLOCKER.into(),
+    }
 }
 
 /// Build a `CleanupItemOutcome` with the `Failed` outcome and a
@@ -1042,14 +992,6 @@ fn failed_outcome(unit_id: &str, reason: impl Into<String>) -> CleanupItemOutcom
 /// Cheap best-effort `state_5.sqlite` size for the fingerprint.
 fn database_size_hint(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|meta| meta.len())
-}
-
-/// Sanitize `item.unit_id` for use in a backup filename.
-fn plan_id_for(item: &agenttidy_core::cleanup::CleanupItem) -> String {
-    item.unit_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1139,8 +1081,8 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn thread_index_enriches_archived_rollout_with_authoritative_facts() {
+    #[tokio::test]
+    async fn thread_index_enriches_archived_rollout_but_cleanup_requires_verified_recovery() {
         let root = temp_root();
         let archive_dir = root.join("archived_sessions");
         fs::create_dir_all(&archive_dir).unwrap();
@@ -1192,7 +1134,7 @@ mod tests {
 
         assert!(problems.is_empty());
         assert_eq!(sessions[0].title.as_deref(), Some("Archived title"));
-        assert_eq!(sessions[0].created_at, Some(1000));
+        assert_eq!(sessions[0].created_at, Some(1_000_000));
         assert_eq!(
             sessions[0].project.as_ref().unwrap().cwd.as_deref(),
             Some("/indexed/cwd")
@@ -1200,9 +1142,49 @@ mod tests {
         assert_eq!(
             sessions[0].lifecycle,
             SessionLifecycle::Archived {
-                archived_at: Some(3000)
+                archived_at: Some(3_000_000)
             }
         );
+        // A structurally valid, archived consistency set remains visible but
+        // cannot cross the recovery gate, regardless of local CLI availability.
+        let snapshot = AgentSnapshot {
+            installation: installation.clone(),
+            sessions,
+            resources,
+            problems,
+            completed_at: 0,
+        };
+        let units = CodexAdapter.build_cleanup_units(&snapshot).await.unwrap();
+        assert_eq!(units.len(), 1);
+        let error = CodexAdapter
+            .validate_cleanup_unit(&units[0], &installation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(RECOVERY_BLOCKER));
+        let app = agenttidy_core::cleanup::CleanupItem {
+            unit_id: units[0].id.clone(),
+            installation_id: installation.id.clone(),
+            provider: units[0].provider.clone(),
+            fingerprint: units[0].fingerprint.clone(),
+            locator: units[0].locator.clone(),
+            estimated_reclaimable_bytes: 0,
+            action: CleanupAction::ProviderOperation,
+            risk: agenttidy_core::RiskLevel::ReviewRequired,
+            reasons: vec![],
+            preconditions: vec![],
+            evidence: Default::default(),
+        };
+        let before = fs::read(&rollout).unwrap();
+        let outcome = CodexAdapter
+            .execute_provider_operation(&app, &installation)
+            .await
+            .unwrap();
+        assert_eq!(outcome.outcome, CleanupOutcome::Failed);
+        assert_eq!(outcome.reason.as_deref(), Some(RECOVERY_BLOCKER));
+        assert_eq!(fs::read(&rollout).unwrap(), before);
+        assert!(CodexAdapter::thread_index(&root)
+            .unwrap()
+            .contains_key("s-archive"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1261,6 +1243,28 @@ mod tests {
         };
         assert!(database.ends_with("state_5.sqlite"));
         assert_eq!(record_id, "thr-1");
+        let identity = file_identity(database).unwrap();
+        assert_eq!(unit.fingerprint.identity.volume, identity.volume);
+        assert_eq!(unit.fingerprint.identity.index, identity.index);
+        let metadata = fs::metadata(database).unwrap();
+        assert_eq!(unit.fingerprint.size_bytes, metadata.len());
+        assert_eq!(
+            unit.fingerprint.mtime_ms,
+            metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+        );
+        let locks = root.join("thread-writer-locks");
+        fs::create_dir(&locks).unwrap();
+        fs::write(locks.join("writer.lock"), b"busy").unwrap();
+        let error = CodexAdapter
+            .validate_cleanup_unit(unit, &installation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("writer lock present"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1343,167 +1347,71 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Integration: end-to-end §12.4 self-implementation on a
-    /// fixture `state_5.sqlite` with `threads` /
-    /// `thread_attachments` / `thread_spawn_edges` rows. The
-    /// backup is written, the row is deleted, FK check is clean,
-    /// and the source file is replaced atomically.
+    /// Unknown native protocols must fail closed before any delete. These
+    /// tests inspect command construction; they never run the installed CLI.
+    #[test]
+    fn native_commands_are_scoped_to_the_detected_installation() {
+        let root = PathBuf::from("test-profile");
+        let command = native_codex_command(&root);
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "CODEX_HOME" && value == Some(root.as_os_str())));
+        assert!(parse_native_version(b"codex-cli 0.152.0\n").is_ok());
+        assert!(parse_native_version(b"codex-cli 0.153.0\n").is_err());
+        assert!(parse_native_version(b"unexpected output").is_err());
+    }
+    /// Missing, non-zero and unsupported CLI probes are read-only admission
+    /// failures, and none can conceal or lift the independent recovery gate.
     #[tokio::test]
-    async fn execute_provider_operation_self_implementation_removes_thread_rows() {
+    async fn cli_preflight_reports_failures_before_confirmation() {
         let root = temp_root();
-        let db_path = root.join("state_5.sqlite");
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER NOT NULL DEFAULT 0);
-                 CREATE TABLE thread_attachments (thread_id TEXT NOT NULL, blob TEXT);
-                 CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);
-                 INSERT INTO threads VALUES ('thr-1', 1);
-                 INSERT INTO thread_attachments VALUES ('thr-1', 'att-data');
-                 INSERT INTO thread_spawn_edges VALUES ('thr-1', 'thr-2');
-                 INSERT INTO thread_spawn_edges VALUES ('thr-0', 'thr-1');",
-            )
-            .unwrap();
-        }
-        let installation = installation(&root);
-        let item = agenttidy_core::cleanup::CleanupItem {
-            unit_id: "codex:default:row:thr-1".into(),
-            installation_id: installation.id.clone(),
-            provider: ProviderId::new(ProviderId::CODEX),
-            fingerprint: ResourceFingerprint {
-                path: db_path.clone(),
-                identity: FileIdentity {
-                    volume: 0,
-                    index: 0,
-                },
-                size_bytes: 0,
-                mtime_ms: 0,
-            },
-            locator: CleanupLocator::DbRow {
-                database: db_path.clone(),
-                record_id: "thr-1".into(),
-            },
-            estimated_reclaimable_bytes: 1024,
-            action: CleanupAction::ProviderOperation,
-            risk: agenttidy_core::cleanup::RiskLevel::ReviewRequired,
-            reasons: vec![],
-            preconditions: CodexAdapter::provider_operation_preconditions(),
-        };
-
-        // Isolate the backup directory so the test does not pollute
-        // the real `$HOME/.agenttidy/backup/`.
-        let backup_root = std::env::temp_dir().join(format!(
-            "agenttidy-codex-backup-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&backup_root).unwrap();
-        // SAFETY: the backup helper reads HOME/USERPROFILE for its
-        // default location. We override HOME for the duration of the
-        // test only.
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &backup_root);
-
-        // The native `codex delete` binary may or may not exist; the
-        // fallback path is the deterministic one for this test. PATH
-        // keeps the system dirs so any concurrent platform helper
-        // (e.g. macOS `osascript`) still resolves, while `codex`
-        // (installed under ~/.nvm or /opt/homebrew) is not found.
-        let empty_path = std::env::temp_dir().join(format!(
-            "agenttidy-codex-empty-path-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&empty_path).unwrap();
-        let previous_path = std::env::var("PATH").ok();
-        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", empty_path.display()));
-
-        let outcome = CodexAdapter
-            .execute_provider_operation(&item, &installation)
+        let error = probe_native_cli(Command::new(root.join("missing-codex")))
             .await
-            .expect("execute_provider_operation must succeed");
-
-        assert_eq!(outcome.outcome, CleanupOutcome::Removed);
-        assert!(outcome
-            .reason
-            .as_deref()
-            .unwrap_or("")
-            .contains("self-implementation"));
-        assert!(outcome
-            .reason
-            .as_deref()
-            .unwrap_or("")
-            .contains("backup at"));
-
-        // The threads row must be gone, and the spawn-edge rows
-        // that referenced thr-1 must also be gone.
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let thread_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM threads WHERE id = 'thr-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(thread_count, 0);
-        let att_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM thread_attachments WHERE thread_id = 'thr-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(att_count, 0);
-        let edge_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM thread_spawn_edges WHERE parent_thread_id = 'thr-1' OR child_thread_id = 'thr-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(edge_count, 0);
-
-        // A backup file for thr-1 must exist under backup_root
-        // (recursively — the helper writes to $HOME/.agenttidy/backup/).
-        fn find_stem(dir: &Path, needle: &str) -> bool {
-            for entry in std::fs::read_dir(dir).unwrap().flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if find_stem(&path, needle) {
-                        return true;
-                    }
-                } else if path
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().contains(needle))
-                {
-                    return true;
-                }
-            }
-            false
-        }
-        let found = find_stem(&backup_root, "thr-1");
-        assert!(
-            found,
-            "backup file for thr-1 must exist under {backup_root:?}"
-        );
-
-        // Restore env.
-        match previous_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match previous_path {
-            Some(value) => std::env::set_var("PATH", value),
-            None => std::env::remove_var("PATH"),
-        }
-        std::fs::remove_dir_all(&backup_root).ok();
-        std::fs::remove_dir_all(&empty_path).ok();
+            .unwrap_err();
+        assert!(error.starts_with("Codex CLI unavailable:"));
+        let mut rejected = Command::new(std::env::current_exe().unwrap());
+        rejected.arg("--agenttidy-invalid-argument");
+        let error = probe_native_cli(rejected).await.unwrap_err();
+        assert!(error.contains("version probe exited"));
+        let error = parse_native_version(b"codex-cli 0.153.0\n").unwrap_err();
+        assert!(error.starts_with("Codex CLI unsupported:"));
+        let reason = cleanup_admission_reason(Some(&error));
+        assert!(reason.contains(RECOVERY_BLOCKER));
+        assert!(reason.contains("Codex CLI unsupported:"));
+        assert_eq!(cleanup_admission_reason(None), RECOVERY_BLOCKER);
         fs::remove_dir_all(root).unwrap();
+    }
+    /// Child harness isolates a stalled launcher without shell scripts, PATH
+    /// mutation or relying on any installed Codex binary (§18).
+    #[test]
+    fn stalled_cli_probe_child() {
+        if std::env::var_os("AGENTTIDY_STALLED_CLI").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_cli_probe_has_a_bounded_wait() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::stalled_cli_probe_child"])
+            .env("AGENTTIDY_STALLED_CLI", "1");
+        let error = bounded_cli_output(command, std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.contains("version probe timed out"));
+    }
+    /// Real local timestamp ranges are ~1.79e9 seconds, not milliseconds.
+    /// Pin the unit boundary so dates/age filters cannot regress to 1970.
+    #[test]
+    fn thread_epoch_seconds_are_converted_to_domain_milliseconds() {
+        assert_eq!(
+            epoch_seconds_to_ms(Some(1_792_506_833)),
+            Some(1_792_506_833_000)
+        );
+        assert_eq!(epoch_seconds_to_ms(Some(0)), Some(0));
+        assert_eq!(epoch_seconds_to_ms(None), None);
+        assert_eq!(epoch_seconds_to_ms(Some(-1)), None);
+        assert_eq!(epoch_seconds_to_ms(Some(i64::MAX)), None);
     }
 }

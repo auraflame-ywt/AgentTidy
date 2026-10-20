@@ -71,6 +71,13 @@ Related: `~/Documents/ChatGPT/` (153 MB in sample) is the analogous default work
 - **Rollout file**: `sessions/YYYY/MM/DD/rollout-<ISO-ts>-<uuid>.jsonl`, one per session, append-only. The **DB (`state_5.sqlite.threads`) is authoritative**: `threads.rollout_path` stores the absolute rollout path.
 - **JSONL line types** (sample): `session_meta` (first line: `session_id`, `parent_thread_id`, `cwd`, `originator`, `cli_version`, `source`, `model_provider`), `turn_context` (per turn: `turn_id`, `cwd`, `workspace_roots`, `approval_policy`, `sandbox_policy`), `event_msg` (`task_started`, `token_count`, `task_complete`, `thread_settings_applied`, …), `response_item` (`message`, `reasoning`, …), `world_state`.
 - `state_5.sqlite.threads` columns (key ones): `id`, `rollout_path`, `created_at`, `updated_at`, `source`, `model_provider`, `cwd`, `title`, `archived`, `archived_at`, `git_sha`, `git_branch`, `git_origin_url`, `cli_version`, `first_user_message`, `thread_source`, `originator`, `is_pinned`, `project_id` → `projects`.
+- Local Mac verification (2026-10-20): `threads.created_at`, `updated_at`,
+  `archived_at` contain Unix **seconds** (observed ~1.78–1.79 billion), while
+  AgentTidy domain timestamps are milliseconds. The provider multiplies these
+  verified columns by 1000 with overflow/negative checks. The local schema also
+  has `created_at_ms`/`updated_at_ms`; the current mapping continues to use the
+  investigated seconds columns rather than inferring units by magnitude.
+
 - `thread_history_1.sqlite` = searchable projection: `thread_items(thread_id, turn_id, item_id, rollout_ordinal, item_json, …)`, `thread_turns(thread_id, turn_id, rollout_ordinal, status, duration_ms, …)`.
 - `thread_spawn_edges(parent_thread_id, child_thread_id, status)` records parent/child relations.
 
@@ -193,7 +200,7 @@ Codex Desktop / Codex app creates **default per-day workspace dirs under `%USERP
 ## Open questions (Phase 0 continues)
 
 - [x] Windows path (`%USERPROFILE%\.codex` verified 2026-09-20; also whether the default workspace is `%USERPROFILE%\Documents\Codex\` on Windows — verified).
-- [x] Does Codex expose a native "delete thread" that also fixes DB? **Yes** — `codex delete <SESSION>` (verified in codex-cli 0.152.0, `codex delete --help`: "Permanently delete a saved session by id or session name"). This is the Application-layer's preferred path for `CleanupAction::ProviderOperation`; the §12.4 self-implementation (backup → BEGIN IMMEDIATE → DELETE → FK check) remains as a fallback when the binary is unavailable, fails, or behaves unexpectedly. Both paths are documented in [`../safety/provider-operation.md`](../safety/provider-operation.md).
+- [ ] Native delete **semantics and recovery are not closed**. The installed codex-cli 0.152.0 exposes `codex delete <SESSION>` and non-interactive `--force` (UUID only). On 2026-10-20 an isolated synthetic rollout / schema-reconstructed state returned `failed to delete session`; no success or complete multi-file recovery is certified. Help/version checks alone are insufficient. Direct DB replacement fallback is disabled; see [`../safety/provider-operation.md`](../safety/provider-operation.md) and [`../testing/macos-scenarios.md`](../testing/macos-scenarios.md).
 - [ ] `logs_2.sqlite` rotation/retention policy (does Codex ever prune it?).
 - [ ] Behavior of `attachments/` when its thread is archived (moved or left?).
 - [ ] When are `%USERPROFILE%\Documents\Codex\YYYY-MM-DD\<chat>\` dirs created vs a user-picked cwd? (default-workspace trigger conditions)

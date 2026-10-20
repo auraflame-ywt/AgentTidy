@@ -77,10 +77,9 @@ fn envelope<T>(command: &'static str, mode: &'static str, data: T) -> JsonEnvelo
     }
 }
 
-/// Step 1 — build the typed cleanup plan (read-only, no side effects).
-/// Phase 6 providers return zero units, so `data.items` is always empty
-/// until the Phase 7 provider beta; the GUI still renders the full
-/// Review view around it.
+/// Step 1 — build a read-only preview with metadata evidence (§12.1).
+/// Execute independently rediscovers installations and re-proves each unit;
+/// this command's Application instance is never retained across requests.
 #[tauri::command]
 pub async fn cleanup_preview() -> Result<JsonEnvelope<CleanupPlan>, String> {
     let application = Application::new();

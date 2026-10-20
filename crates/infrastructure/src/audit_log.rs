@@ -17,7 +17,7 @@
 //! #11), and `fsync` is an OS-mac detail.
 
 use agenttidy_core::CleanupEvent;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -29,9 +29,9 @@ pub(crate) const AUDIT_LOG_DIR: &str = ".agenttidy";
 const AUDIT_LOG_FILE: &str = "operations.jsonl";
 
 /// Audit log open / write errors. The executor maps these to
-/// `CleanupOutcome::Failed`; the log failure never blocks a successful
-/// trash operation, but it *does* abort the rest of the batch so the
-/// user sees a uniform failure (no half-recorded plans).
+/// `CleanupOutcome::Failed`. Open/intent failure prevents mutation; a result
+/// write failure preserves the operation outcome in the report and stops
+/// all remaining mutations. A durable Pending intent supports crash diagnosis.
 #[derive(Debug, Error)]
 pub enum AuditLogError {
     #[error("home directory is not set; cannot resolve audit log path")]
@@ -60,33 +60,72 @@ pub fn audit_log_path() -> Result<PathBuf, AuditLogError> {
     Ok(home.join(AUDIT_LOG_DIR).join(AUDIT_LOG_FILE))
 }
 
-/// Append one [`CleanupEvent`] to the log.
-///
-/// The full file is opened in append mode + `fsync` per write — slow but
-/// crash-resilient. Phase 6's executor does not run cleanup at high
-/// frequency, so the cost is acceptable; Phase 7 can introduce a
-/// buffered writer if needed.
-pub fn record(event: &CleanupEvent) -> Result<(), AuditLogError> {
-    let path = audit_log_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| AuditLogError::Directory {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let mut line = serde_json::to_string(event).map_err(AuditLogError::Serialize)?;
-    line.push('\n');
+/// Open append-only audit sink before any mutation (§16.3). Holding this
+/// handle for the batch prevents later path/permission changes from silently
+/// redirecting writes; each intent/result is synced independently.
+pub struct AuditWriter {
+    file: File,
+}
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|source| AuditLogError::Write { source })?;
-    file.write_all(line.as_bytes())
-        .map_err(|source| AuditLogError::Write { source })?;
-    file.sync_all()
-        .map_err(|source| AuditLogError::Write { source })?;
-    Ok(())
+impl AuditWriter {
+    pub fn open() -> Result<Self, AuditLogError> {
+        Self::open_at(&audit_log_path()?)
+    }
+
+    /// Explicit paths keep permission/failure tests isolated from user logs.
+    pub fn open_at(path: &Path) -> Result<Self, AuditLogError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| AuditLogError::Directory {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)
+            .map_err(|source| AuditLogError::Write { source })?;
+        use std::io::{Read, Seek, SeekFrom};
+        if file
+            .metadata()
+            .map_err(|source| AuditLogError::Write { source })?
+            .len()
+            > 0
+        {
+            file.seek(SeekFrom::End(-1))
+                .map_err(|source| AuditLogError::Write { source })?;
+            let mut last = [0];
+            file.read_exact(&mut last)
+                .map_err(|source| AuditLogError::Write { source })?;
+            if last[0] != b'\n' {
+                // Keep the truncated line for diagnosis, but don't concatenate
+                // a new durable event into that malformed JSON fragment.
+                file.write_all(b"\n")
+                    .and_then(|_| file.sync_all())
+                    .map_err(|source| AuditLogError::Write { source })?;
+            }
+        }
+        Ok(Self { file })
+    }
+
+    pub fn record(&mut self, event: &CleanupEvent) -> Result<(), AuditLogError> {
+        let mut line = serde_json::to_vec(event).map_err(AuditLogError::Serialize)?;
+        line.push(b'\n');
+        self.file
+            .write_all(&line)
+            .map_err(|source| AuditLogError::Write { source })?;
+        self.file
+            .sync_all()
+            .map_err(|source| AuditLogError::Write { source })?;
+        Ok(())
+    }
+}
+
+/// One-shot convenience for diagnostics/tests. Execution keeps its writer
+/// open and records a durable Pending intent before invoking an operation.
+pub fn record(event: &CleanupEvent) -> Result<(), AuditLogError> {
+    AuditWriter::open()?.record(event)
 }
 
 /// Read all recorded events (test/inspection helper). Not used by the
@@ -261,5 +300,22 @@ mod tests {
                 std::env::set_var(HOME_VAR, value);
             }
         }
+    }
+    /// A crash can truncate the final JSON line. Appending must preserve
+    /// subsequent intent/result records rather than concatenate them into it.
+    #[test]
+    fn resumed_writer_separates_a_truncated_crash_line() {
+        let root = temp_home("truncated");
+        let path = root.join("operations.jsonl");
+        std::fs::write(&path, b"{\"unit_id\":").unwrap();
+        let mut writer = AuditWriter::open_at(&path).unwrap();
+        writer.record(&event(1, CleanupOutcome::Pending)).unwrap();
+        writer.record(&event(2, CleanupOutcome::Removed)).unwrap();
+        drop(writer);
+        let events = read_all(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, CleanupOutcome::Pending);
+        assert_eq!(events[1].outcome, CleanupOutcome::Removed);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

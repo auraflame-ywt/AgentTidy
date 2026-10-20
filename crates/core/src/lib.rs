@@ -23,10 +23,10 @@ pub mod snapshot;
 
 pub use capability::{AgentCapabilities, CapabilityStatus, CapabilityTopic};
 pub use cleanup::{
-    CleanupAction, CleanupDecision, CleanupEvent, CleanupItem, CleanupItemOutcome, CleanupLocator,
-    CleanupOperation, CleanupOutcome, CleanupPlan, CleanupPrecondition, CleanupPreconditionKind,
-    CleanupRevalidationOutcome, CleanupUnit, CleanupUnitKind, FileIdentity, ResourceFingerprint,
-    RiskLevel, RiskSummary,
+    CleanupAction, CleanupDecision, CleanupEvent, CleanupEvidence, CleanupItem, CleanupItemOutcome,
+    CleanupLocator, CleanupOperation, CleanupOutcome, CleanupPlan, CleanupPrecondition,
+    CleanupPreconditionKind, CleanupRevalidationOutcome, CleanupUnit, CleanupUnitKind,
+    FileIdentity, ResourceFingerprint, RiskLevel, RiskSummary,
 };
 pub use installation::{AgentInstallation, InstallationStatus, Platform};
 pub use provider::ProviderId;

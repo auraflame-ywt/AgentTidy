@@ -28,3 +28,8 @@ pub mod processes;
 pub mod sqlite;
 pub mod trash;
 pub mod workspace_safety;
+
+// Strict native tests are opt-in: they trash and restore only their own
+// uniquely named samples. Ordinary CI cannot certify native recovery (§18.4).
+#[cfg(all(test, target_os = "macos"))]
+mod macos_acceptance;

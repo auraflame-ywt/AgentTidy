@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Hybrid repo: Rust workspace + pnpm workspace. Pre-alpha skeleton; most crates are placeholders. Full design doc: `Start.md` (Chinese) — code doc-comments reference it by section (e.g. §10, §18, §22).
+Hybrid repo: Rust workspace + pnpm workspace. Phase 7 cleanup Beta implementation; cross-platform recovery and real-user acceptance remain pending. Full design doc: `Start.md` (Chinese) — code doc-comments reference it by section (e.g. §10, §18, §22).
 
 ## Commands
 
@@ -13,9 +13,10 @@ cargo run -p agenttidy-cli                         # run the CLI (bin name: agen
 pnpm install                                      # frontend deps (pnpm@10, Node >= 20)
 pnpm tauri dev                                    # desktop app (from repo root)
 pnpm build:desktop                                 # tsc -b && vite build (this is the typecheck)
+pnpm test:desktop                                  # pure frontend scenario regressions (Node runner)
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt + clippy + test on **macOS and Windows**, and `pnpm build:desktop` on Linux. Run all three Rust checks locally before pushing; there is no separate frontend lint — `pnpm build:desktop` is the gate.
+CI (`.github/workflows/ci.yml`) runs fmt + clippy + test on **macOS and Windows**, and `pnpm build:desktop` + `pnpm test:desktop` on Linux. Run all three Rust checks locally before pushing; there is no separate frontend lint — `pnpm build:desktop` is the gate.
 
 ## Architecture (enforced red lines — see Start.md §22, ADR-0001)
 
@@ -26,7 +27,7 @@ CI (`.github/workflows/ci.yml`) runs fmt + clippy + test on **macOS and Windows*
 - No dynamic plugin system; provider registry is static.
 - Default posture: read-only, trash-first, fail-closed. Unknown/Shared/Unsupported resources default to Blocked.
 
-Domain types are intentionally not frozen yet — they land after Phase 0 provider investigation (Start.md §19). Don't model ahead of that.
+Domain and cleanup types are implemented after Phase 0 investigation (Start.md §19). Keep additions grounded in verified provider samples; do not model unsupported resource types ahead of investigation.
 
 ## Global constraints
 

@@ -25,6 +25,7 @@ import {
   type ReactNode,
 } from "react";
 import { en, type TranslationKey } from "./en";
+import { cleanupReasonKey } from "../cleanup-reasons";
 import { zh } from "./zh";
 
 export type { TranslationKey };
@@ -64,6 +65,7 @@ interface I18nContextValue {
   /** Map a backend ScanProblem code to localized text (zh), falling back
    * to the backend's English message for en or unknown codes. */
   translateDiagnostic: (code: string, fallback: string) => string;
+  translateCleanupReason: (reason: string) => string;
 }
 
 const I18nContext = createContext<I18nContextValue | null>(null);
@@ -119,6 +121,10 @@ export function I18nProvider({ children }: { children: ReactNode }) {
       lang,
       setLang,
       t: (key, params) => lookup(lang, key, params),
+      translateCleanupReason: reason => {
+        const key = cleanupReasonKey(reason);
+        return key ? lookup(lang, key) : reason;
+      },
       translateDiagnostic: (code, fallback) => {
         if (lang === "en") return fallback;
         // Exact match on a stable code first.

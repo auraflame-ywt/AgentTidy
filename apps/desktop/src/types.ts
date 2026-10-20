@@ -279,14 +279,24 @@ export type CleanupLocator =
   | { kind: "db-row"; database: string; record_id: string };
 
 /** `crates/core/src/cleanup.rs` `CleanupItem` — one plan row. */
+/** Preview evidence is returned unchanged over IPC; it contains no message bodies. */
+export interface CleanupEvidence {
+  provider_version: string | null;
+  schema_versions: Record<string, string>;
+  journal_modes: Record<string, string>;
+  canonical_paths: Record<string, string>;
+  members: ResourceFingerprint[];
+}
+
 export interface CleanupItem {
+  evidence: CleanupEvidence;
   unit_id: string;
   installation_id: string;
   provider: ProviderId;
   fingerprint: ResourceFingerprint;
   /** Denormalized from the unit — the executor moves every member path. */
   locator: CleanupLocator;
-  /** Denormalized reclaim estimate (§16.3 `reclaimed_bytes` on success). */
+  /** Logical estimate for review; never a measurement of immediate disk reclamation. */
   estimated_reclaimable_bytes: number;
   action: CleanupAction;
   risk: RiskLevel;

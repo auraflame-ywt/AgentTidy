@@ -12,7 +12,7 @@
 // stays untouched) and exposes the EN / 中文 segmented toggle in the
 // header. Backend error text in the banner stays English by design.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { I18nProvider, useI18n, type Lang } from "./i18n";
 import { useCleanupState, useScanState } from "./state";
 import Diagnostics from "./views/Diagnostics";
@@ -21,6 +21,10 @@ import Overview from "./views/Overview";
 import Review from "./views/Review";
 import ReviewConfirm from "./views/ReviewConfirm";
 import Sessions from "./views/Sessions";
+import StartupScreen from "./components/StartupScreen";
+import { useStartupScreen } from "./useStartupScreen";
+import { DEFAULT_SESSION_QUERY, type SessionQuery } from "./session-query";
+import type { AgentSnapshot, ProviderId } from "./types";
 
 type Tab = "overview" | "sessions" | "tidy" | "diagnostics";
 
@@ -70,7 +74,23 @@ function AppShell() {
   const [tab, setTab] = useState<Tab>("overview");
   const [showConfirm, setShowConfirm] = useState(false);
   const { reports, snapshots, loading, error, refresh } = useScanState();
-  const cleanup = useCleanupState();
+  const cleanup = useCleanupState(tab === "tidy");
+  const startup = useStartupScreen(loading, error);
+  const [brandPreview, setBrandPreview] = useState(false);
+  const [sessionQuery, setSessionQuery] = useState<SessionQuery>(DEFAULT_SESSION_QUERY);
+  const [executionSnapshots, setExecutionSnapshots] = useState<AgentSnapshot[]>([]);
+  const [attemptedIds, setAttemptedIds] = useState<ReadonlySet<string>>(new Set());
+  const browse = (provider?: ProviderId) => {
+    setSessionQuery({ ...DEFAULT_SESSION_QUERY, provider: provider ?? "all", order: "largest" });
+    setTab("sessions");
+  };
+
+  // A completed cleanup changes the disk snapshot shown in the other tabs.
+  // Keep its result report visible while refreshing only the read-only data.
+  useEffect(() => { if (cleanup.outcomes) refresh(); }, [cleanup.outcomes, refresh]);
+  useEffect(() => {
+    if (!cleanup.revalidated) setShowConfirm(false);
+  }, [cleanup.revalidated, cleanup.plan?.fingerprint]);
 
   const tabs: ReadonlyArray<{ id: Tab; label: string }> = [
     { id: "overview", label: t("tab.overview") },
@@ -92,22 +112,33 @@ function AppShell() {
       ?.items.filter((item) => cleanup.selectedIds.has(item.unit_id))
       .reduce((sum, item) => sum + item.estimated_reclaimable_bytes, 0) ?? 0;
 
+  if (!startup.dismissed || brandPreview) return <StartupScreen
+    loading={loading} error={error} leaving={startup.leaving} preview={brandPreview}
+    sessions={snapshots.reduce((sum, snapshot) => sum + snapshot.sessions.length, 0)} agents={reports.length}
+    onRetry={refresh} onContinue={() => { startup.dismiss(); setBrandPreview(false); if (error) setTab("diagnostics"); }} />;
+
   return (
     <div className="min-h-screen bg-neutral-50 text-neutral-900">
       <header className="border-b border-neutral-200 bg-white">
         <div className="mx-auto flex max-w-6xl items-baseline justify-between px-6 py-4">
-          <div>
+          <div className="flex items-center gap-3">
+            <button type="button" onClick={() => setBrandPreview(true)} disabled={cleanup.phase === "execute"}
+              title={t("startup.about")} aria-label={t("startup.about")} className="rounded-xl">
+              <img src="/brand/agenttidy-icon.png" width="44" height="44" alt="" />
+            </button>
+            <div>
             <h1 className="text-xl font-semibold tracking-tight">
               AgentTidy
             </h1>
             <p className="text-xs text-neutral-500">{t("header.tagline")}</p>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <LangToggle />
             <button
               type="button"
-              onClick={refresh}
-              disabled={loading}
+              onClick={() => { setShowConfirm(false); refresh(); if (cleanup.plan || cleanup.executionAttempted || tab === "tidy") cleanup.refreshPreview(); }}
+              disabled={loading || cleanup.loading}
               className="rounded-md border border-neutral-300 bg-white px-3 py-1.5 text-sm font-medium text-neutral-700 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {loading ? t("common.scanning") : t("common.refresh")}
@@ -120,6 +151,7 @@ function AppShell() {
               key={entry.id}
               type="button"
               onClick={() => setTab(entry.id)}
+              aria-current={tab === entry.id ? "page" : undefined}
               className={`rounded-md px-3 py-1 text-sm font-medium ${
                 tab === entry.id
                   ? "bg-neutral-900 text-white"
@@ -143,10 +175,17 @@ function AppShell() {
           </div>
         ) : null}
 
-        {tab === "tidy" ? (
+        {loading && snapshots.length === 0 && tab !== "tidy" ? (
+          <p role="status" className="rounded-xl border border-neutral-200 bg-white p-8 text-neutral-500">{t("common.scanning")}</p>
+        ) : tab === "tidy" ? (
           <Review
             plan={cleanup.plan}
+            snapshots={cleanup.executionAttempted ? executionSnapshots : snapshots}
+            attemptedIds={attemptedIds}
+            onDiagnostics={() => setTab("diagnostics")}
             loading={cleanup.loading}
+            phase={cleanup.phase}
+            executionAttempted={cleanup.executionAttempted}
             selectedIds={cleanup.selectedIds}
             revalidation={cleanup.revalidation}
             outcomes={cleanup.outcomes}
@@ -162,10 +201,15 @@ function AppShell() {
           <Overview
             reports={reports}
             snapshots={snapshots}
+            plan={cleanup.executionAttempted ? null : cleanup.plan}
+            loading={loading}
+            onBrowse={browse}
+            onReview={() => setTab("tidy")}
             onJumpToDiagnostics={() => setTab("diagnostics")}
           />
         ) : tab === "sessions" ? (
-          <Sessions snapshots={snapshots} />
+          <Sessions snapshots={snapshots} plan={cleanup.executionAttempted ? null : cleanup.plan}
+            query={sessionQuery} onQueryChange={setSessionQuery} onReview={() => setTab("tidy")} />
         ) : (
           <Diagnostics reports={reports} />
         )}
@@ -173,10 +217,17 @@ function AppShell() {
 
       {showConfirm && cleanup.plan ? (
         <ReviewConfirm
+          key={cleanup.plan.fingerprint}
           plan={cleanup.plan}
+          selectedTrashOnly={cleanup.plan.items.filter(item => cleanup.selectedIds.has(item.unit_id))
+            .every(item => item.action === "trash")}
           selectedCount={cleanup.selectedIds.size}
           selectedBytes={selectedBytes}
           onConfirm={() => {
+            // Keep the reviewed identities available after the successful
+            // read-only refresh removes their resources from the current scan.
+            setExecutionSnapshots(snapshots);
+            setAttemptedIds(new Set(cleanup.selectedIds));
             setShowConfirm(false);
             cleanup.execute();
           }}

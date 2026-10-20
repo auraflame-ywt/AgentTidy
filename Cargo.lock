@@ -19,6 +19,7 @@ dependencies = [
  "agenttidy-provider-api",
  "agenttidy-workbuddy",
  "anyhow",
+ "async-trait",
  "serde",
  "serde_json",
  "sha2",

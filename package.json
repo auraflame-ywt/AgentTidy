@@ -10,6 +10,7 @@
   "scripts": {
     "dev:desktop": "pnpm --filter @agenttidy/desktop dev",
     "build:desktop": "pnpm --filter @agenttidy/desktop build",
-    "tauri": "pnpm --filter @agenttidy/desktop tauri"
+    "tauri": "pnpm --filter @agenttidy/desktop tauri",
+    "test:desktop": "pnpm --filter @agenttidy/desktop test"
   }
 }

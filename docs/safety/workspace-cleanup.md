@@ -121,10 +121,18 @@ a new success (idempotent reporting). Partial failure never corrupts the
 report — each remaining unit still executes and records independently. No
 cross-database global transaction is promised in v0.1.
 
-**Operation guard (§12.1 "acquire operation guard")** is deferred to
-Phase 7: Phase 6 executes single-user, single-call flows where concurrent
-cleanup of the same plan has no UI path. Reviewers should treat
-concurrent-execute hardening as an open Phase 7 threat-model item.
+**Operation guard (§12.1)** is acquired before revalidation and held for
+execution/audit. Every selected item is re-scanned and its unit, policy,
+provider validation, canonical paths and recursive member fingerprints are
+checked immediately before its mutation. Independent IPC requests discover
+installations afresh; there is no preview-instance cache. Full plan payloads
+and expiry are fingerprinted. Selected stale/blocked items are audited as
+`skipped`; each item also checks TTL after its revalidation.
+
+File-set membership, nested member metadata and inspection evidence are
+stored in the preview. These are metadata checks, not content hashes, and
+cannot prevent an external writer starting after the final check. Native
+integration and recovery validation remain release gates.
 
 ## Audit log
 
@@ -146,3 +154,23 @@ Eligible workspaces are moved to the OS Trash as one directory; AgentTidy
 never partially deletes their contents. User-selected projects,
 repositories, shared workspaces, and all non-default locations stay
 Blocked.
+
+### Mac execution hardening (2026-10-20)
+
+- Provider validation/evidence failure becomes a Blocked row with its reason;
+  it does not erase healthy rows or other providers from the preview. Blocked
+  bytes are excluded from `total_reclaimable_bytes`.
+- The persistent operation-lock file is protected by an OS advisory lock.
+  Process exit releases ownership; file age never grants takeover. Do not
+  unlink a live lock file. Unknown legacy stamps require manual inspection
+  after older clients have stopped, not automatic removal.
+- The audit sink opens before mutation. A synced Pending intent precedes each
+  operation, followed by a final result; skipped selections record a final
+  event without intent. A missing final result means uncertain execution,
+  never proof of rollback or success. Truncated crash lines are separated
+  before appending new events. Logging failure stops subsequent mutations.
+- Actual reclaimed bytes are zero for a Trash move. The selected/preview size
+  is an estimate; files in Trash still occupy disk space. No automatic purge.
+
+Local evidence and remaining acceptance items:
+[`../testing/macos-scenarios.md`](../testing/macos-scenarios.md).

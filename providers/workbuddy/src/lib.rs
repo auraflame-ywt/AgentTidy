@@ -116,7 +116,10 @@ impl WorkBuddyAdapter {
     }
 
     fn running() -> bool {
-        any_process_running(&[ProcessSignature::new(&["WorkBuddy", "workbuddy"], &[])])
+        any_process_running(&[ProcessSignature::new(
+            &["WorkBuddy", "workbuddy"],
+            &["workbuddy.app/contents/"],
+        )])
     }
 
     fn readable(path: &Path) -> bool {

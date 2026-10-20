@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 # tokio: the async Application methods are exercised from `#[tokio::test]`
 # cases covering the Phase 6 cleanup policy / revalidate / execute flow.
 tokio = { workspace = true }

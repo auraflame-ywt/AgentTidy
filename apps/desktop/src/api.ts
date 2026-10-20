@@ -1,8 +1,8 @@
 // Typed wrappers around the Tauri `invoke` IPC. The Rust side defines each
 // command in `apps/desktop/src-tauri/src/commands.rs`; the strings here
-// must match those `#[tauri::command]` names exactly. `tsc -b` enforces
-// type-level matching against `./types` — a field rename on the Rust side
-// surfaces as a frontend build failure here.
+// must match those `#[tauri::command]` names exactly. `tsc -b` checks these
+// wrappers against the manually mirrored `./types`; it cannot detect a Rust
+// field rename by itself. IPC shape changes require cross-boundary validation.
 
 import { invoke } from "@tauri-apps/api/core";
 import type {

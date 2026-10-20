@@ -109,8 +109,24 @@ arrives after other members already moved keeps the honest `failed`
 
 ## Audit log (§16.3)
 
-One `agenttidy.audit.v1` row per item at
+A synced `Pending` intent precedes each mutation, followed by its final
+`agenttidy.audit.v1` result at
 `$HOME/.agenttidy/operations.jsonl`: plan id, unit id, provider, the
 `file-set` locator (all original member paths), action `trash`, outcome,
 estimated/actual reclaimed bytes and skip/failure reasons. No message
 bodies, tokens or file contents are ever logged.
+
+
+## macOS implementation / acceptance (2026-10-20)
+
+Native Trash uses NSFileManager rather than Finder AppleScript; no Finder
+Automation grant is required by this path. Manual move-back is supported,
+but the Finder “Put Back” menu is not guaranteed. A strict temporary-file /
+nested-directory Trash-and-restore test passed on the local Mac, including
+spaces, CJK and quotes. Restricted sandbox refusal is an explicit failure.
+
+Trash moves report zero physical reclaimed bytes; preview sizes are estimates,
+and AgentTidy never empties Trash. Execution uses an OS advisory lock (released
+on process exit/crash), a pre-opened audit sink, synced Pending intent and final
+result. An unavailable audit sink prevents mutation; result-write failure stops
+later items. See [`../testing/macos-scenarios.md`](../testing/macos-scenarios.md).

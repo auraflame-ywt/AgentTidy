@@ -37,6 +37,32 @@ impl ProcessSignature {
     }
 }
 
+/// Match both the display name and executable location: several macOS
+/// products ship the main binary as `Electron`, not their product name.
+/// Executable paths are used even when command-line access is restricted.
+fn matches_process(
+    signature: &ProcessSignature,
+    name: &str,
+    executable: Option<&std::path::Path>,
+    command: &[String],
+) -> bool {
+    let stem = name.to_lowercase().trim_end_matches(".exe").to_string();
+    if signature.exe_names.contains(&stem) {
+        return true;
+    }
+    if signature.cmdline_substrings.is_empty() {
+        return false;
+    }
+    let executable = executable
+        .map(|path| path.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let command = command.join(" ").to_lowercase();
+    signature
+        .cmdline_substrings
+        .iter()
+        .any(|needle| executable.contains(needle) || command.contains(needle))
+}
+
 /// Is any process matching one of the signatures currently running?
 ///
 /// This is a point-in-time check; a clean return does *not* prove the
@@ -49,34 +75,19 @@ pub fn any_process_running(signatures: &[ProcessSignature]) -> bool {
     let mut system = System::new();
     system.refresh_processes();
 
+    // An empty/restricted process snapshot cannot prove that agents are
+    // stopped. Refuse cleanup rather than interpreting a probe failure as idle.
+    if system
+        .process(sysinfo::Pid::from_u32(std::process::id()))
+        .is_none()
+    {
+        return true;
+    }
     for process in system.processes().values() {
-        // sysinfo 0.30 returns owned strings (&str name, &[String] cmd).
-        let exe_stem = process
-            .name()
-            .to_lowercase()
-            .trim_end_matches(".exe")
-            .to_string();
-
-        for signature in signatures {
-            if signature.exe_names.contains(&exe_stem) {
-                return true;
-            }
-            if !signature.cmdline_substrings.is_empty() {
-                let cmdline = process
-                    .cmd()
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .to_lowercase();
-                if signature
-                    .cmdline_substrings
-                    .iter()
-                    .any(|needle| cmdline.contains(needle))
-                {
-                    return true;
-                }
-            }
+        if signatures.iter().any(|signature| {
+            matches_process(signature, process.name(), process.exe(), process.cmd())
+        }) {
+            return true;
         }
     }
     false
@@ -115,5 +126,27 @@ mod tests {
         assert!(!any_process_running(&[]));
         // Signature with no criteria must not match everything.
         assert!(!any_process_running(&[ProcessSignature::new(&[], &[])]));
+    }
+    /// macOS WorkBuddy 5.8.3 reports Electron as CFBundleExecutable.
+    /// Other Electron products must not be attributed to WorkBuddy (§16.2).
+    #[test]
+    fn electron_bundle_identity_is_checked_without_command_line_access() {
+        let signature = ProcessSignature::new(&["WorkBuddy"], &["workbuddy.app/contents/"]);
+        assert!(matches_process(
+            &signature,
+            "Electron",
+            Some(std::path::Path::new(
+                "/Applications/WorkBuddy.app/Contents/MacOS/Electron"
+            )),
+            &[]
+        ));
+        assert!(!matches_process(
+            &signature,
+            "Electron",
+            Some(std::path::Path::new(
+                "/Applications/Other.app/Contents/MacOS/Electron"
+            )),
+            &[]
+        ));
     }
 }

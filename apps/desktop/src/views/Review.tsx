@@ -1,29 +1,16 @@
-// Review & Tidy view — Start.md §6.3, Phase 6.
-//
-// Visual anchor: the Mac cleaner pattern in `memory/gui-mac-cleaner-
-// design-language.md` — hero stat ("Found / Selected"), top-right CTA
-// pair (Back / Clean Now), per-provider grouped rows of checkbox · name ·
-// reason · size · risk badge. The zh locale lands on the reference
-// screenshot's risk vocabulary (建议清理 / 谨慎清理 / 禁止清理) via the
-// catalog while the English source copy stays canonical — satisfying the
-// memory's "consistent chip text" rule for both locales.
-//
-// Selection rules per §6.3: low-risk default-checked, review-required
-// default-unchecked, blocked never selectable. Phase 6 ships zero units
-// (framework-only), so the empty state explains the Phase 7 rollout.
-//
-// Backend-originated text on this view: `item.reasons[0]`,
-// `outcome.reason` and the error banner stay English by design (Phase 6
-// renders zero units, so reasons never appear today; Phase 7 maps them
-// together with the per-resource safety docs). The `outcome` enum and
-// provider group headers ARE localized.
-
+// Session-oriented review (Start.md §6.3 / §12). Identity is a display-only
+// join to snapshot metadata; risk, membership and admission remain backend facts.
+import ExecutionResults from "./ExecutionResults";
+import { cleanupSession, pathName, primaryCleanupReason, sessionTitle } from "../presentation";
+import { planExpired } from "../cleanup-flow";
+import { usePlanExpired } from "../usePlanExpired";
+import type { CleanupPhase } from "../cleanup-flow";
 import { formatDateTime, humanBytes } from "../format";
 import { useI18n } from "../i18n";
 import type {
   CleanupItem,
   CleanupItemOutcome,
-  CleanupOutcome,
+  AgentSnapshot,
   CleanupPlan,
   CleanupRevalidationOutcome,
   ProviderId,
@@ -67,22 +54,14 @@ function providerLabel(provider: ProviderId, t: Translate): string {
   }
 }
 
-function outcomeLabel(outcome: CleanupOutcome, t: Translate): string {
-  switch (outcome) {
-    case "pending":
-      return t("outcome.pending");
-    case "removed":
-      return t("outcome.removed");
-    case "skipped":
-      return t("outcome.skipped");
-    case "failed":
-      return t("outcome.failed");
-  }
-}
-
 interface ReviewProps {
   plan: CleanupPlan | null;
+  snapshots: AgentSnapshot[];
+  attemptedIds: ReadonlySet<string>;
+  onDiagnostics: () => void;
   loading: boolean;
+  phase: CleanupPhase;
+  executionAttempted: boolean;
   selectedIds: ReadonlySet<string>;
   revalidation: CleanupRevalidationOutcome[];
   outcomes: CleanupItemOutcome[] | null;
@@ -96,7 +75,12 @@ interface ReviewProps {
 
 export default function Review({
   plan,
+  snapshots,
+  attemptedIds,
+  onDiagnostics,
   loading,
+  phase,
+  executionAttempted,
   selectedIds,
   revalidation,
   outcomes,
@@ -106,7 +90,8 @@ export default function Review({
   onOpenConfirm,
   onRefresh,
 }: ReviewProps) {
-  const { t, lang } = useI18n();
+  const { t, lang, translateCleanupReason } = useI18n();
+  const expired = usePlanExpired(plan);
 
   if (loading && !plan) {
     return <p className="text-sm text-neutral-500">{t("review.loading")}</p>;
@@ -135,14 +120,10 @@ export default function Review({
 
   // §12.2 plan TTL: checked at render *and* at click time — a plan that
   // expires while the view is open must never silently execute.
-  const isExpired = (): boolean => {
-    const expiresAt = plan?.expires_at;
-    return expiresAt != null && Date.now() > expiresAt;
-  };
-  const expired = isExpired();
+  const isExpired = (): boolean => planExpired(plan);
 
   const canExecute =
-    !expired &&
+    !loading && !executionAttempted && !expired &&
     selectedIds.size > 0 &&
     revalidated &&
     [...selectedIds].every((id) => !staleIds.has(id));
@@ -167,20 +148,19 @@ export default function Review({
               <span className="font-semibold text-emerald-700">
                 {humanBytes(selectedBytes)}
               </span>{" "}
-              · {t("review.planId", { id: plan?.id.slice(0, 12) ?? "" })}
-              {plan?.expires_at ? (
-                <span className="ml-2 text-xs text-neutral-400">
-                  {t("review.expires", {
-                    when: formatDateTime(plan.expires_at, lang),
-                  })}
-                </span>
-              ) : null}
+
             </p>
+            <p className="mt-2 text-xs text-neutral-500">{t("review.estimateHint")}</p>
+            <details className="mt-2 text-xs text-neutral-400"><summary className="cursor-pointer">{t("detail.technical")}</summary>
+              <p className="mt-1 font-mono">{t("review.planId", { id: plan?.id ?? "—" })}</p>
+              {plan?.expires_at ? <p>{t("review.expires", { when: formatDateTime(plan.expires_at, lang) })}</p> : null}
+            </details>
           </div>
           <div className="flex gap-2">
             <button
               type="button"
               onClick={onRefresh}
+              disabled={loading}
               className="rounded-md border border-neutral-300 bg-white px-4 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-100"
             >
               {t("review.back")}
@@ -204,7 +184,7 @@ export default function Review({
                 onClick={() => {
                   if (!isExpired()) onRevalidate();
                 }}
-                disabled={selectedIds.size === 0 || expired}
+                disabled={loading || executionAttempted || selectedIds.size === 0 || expired}
                 className="rounded-md bg-emerald-600 px-5 py-2 text-sm font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {t("review.reviewSelected")}
@@ -213,14 +193,14 @@ export default function Review({
           </div>
         </div>
 
-        {/* Phase 6 framework-only banner (inline code stays untranslated). */}
-        {items.length === 0 && !loading ? (
-          <div className="mt-4 rounded-md border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
-            {t("review.phase7.before")}
-            <code className="font-mono text-xs">docs/safety/</code>
-            {t("review.phase7.after")}
-          </div>
-        ) : null}
+        {loading ? <p role="status" className="mt-3 text-sm text-neutral-500">
+          {t(phase === "execute" ? "review.executing" : phase === "revalidate" ? "review.revalidating" : "review.loading")}
+        </p> : null}
+        {executionAttempted && !loading ? <p role="status" className="mt-3 text-sm text-neutral-500">{t("review.refreshRequired")}</p> : null}
+        {items.length === 0 && !loading ? <p className="mt-4 rounded-lg bg-neutral-50 p-4 text-sm text-neutral-600">{t("review.noCandidates")}</p> : null}
+        {items.length > 0 && items.every(item => item.risk === "blocked") && !loading ? <div className="mt-4 rounded-lg bg-amber-50 p-4 text-sm text-amber-900">
+          <p>{t("review.allBlocked")}</p><button type="button" onClick={onDiagnostics} className="mt-2 underline underline-offset-2">{t("home.diagnosticsHint")} →</button>
+        </div> : null}
 
         {/* §12.2 TTL gate — "plan expired, rescan" instead of a silent run. */}
         {expired ? (
@@ -266,42 +246,7 @@ export default function Review({
         ) : null}
       </div>
 
-      {/* Execution outcomes (§12.3) — per-item removed / skipped / failed. */}
-      {outcomes ? (
-        <div className="rounded-lg border border-neutral-200 bg-white p-4">
-          <h3 className="text-sm font-semibold text-neutral-900">
-            {t("review.executionResults")}
-          </h3>
-          <ul className="mt-2 space-y-1 text-xs">
-            {outcomes.map((outcome) => (
-              <li
-                key={outcome.unit_id}
-                className="flex items-baseline justify-between gap-2"
-              >
-                <span className="font-mono">{outcome.unit_id}</span>
-                <span>
-                  <span
-                    className={
-                      outcome.outcome === "removed"
-                        ? "font-semibold text-emerald-700"
-                        : outcome.outcome === "skipped"
-                          ? "text-amber-700"
-                          : "font-semibold text-red-700"
-                    }
-                  >
-                    {outcomeLabel(outcome.outcome, t)}
-                  </span>
-                  {outcome.reason ? (
-                    <span className="ml-2 text-neutral-500">
-                      {outcome.reason}
-                    </span>
-                  ) : null}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+      {outcomes || (executionAttempted && !loading && plan && attemptedIds.size > 0) ? <ExecutionResults items={items} outcomes={outcomes} attemptedIds={attemptedIds} snapshots={snapshots} /> : null}
 
       {/* Per-provider grouped rows. */}
       {[...groups.entries()].map(([provider, providerItems]) => (
@@ -317,27 +262,31 @@ export default function Review({
               const badge = riskBadge(item.risk, t);
               const blocked = item.risk === "blocked";
               const stale = staleIds.has(item.unit_id);
-              const primaryReason = item.reasons[0] ?? "";
+              const primaryReason = revalidation.find(value => value.unit_id === item.unit_id && value.outcome !== "pending")?.reason ?? primaryCleanupReason(item);
+              const session = cleanupSession(item, snapshots);
+              const title = session ? sessionTitle(session) : pathName(item.fingerprint.path);
               return (
                 <li
                   key={item.unit_id}
-                  className="flex items-center gap-3 border-b border-neutral-100 px-4 py-3 last:border-b-0"
+                  className="flex items-start gap-3 border-b border-neutral-100 px-4 py-3 last:border-b-0"
                 >
                   <input
                     type="checkbox"
                     checked={selectedIds.has(item.unit_id)}
-                    disabled={blocked || stale}
+                    disabled={loading || executionAttempted || blocked || stale}
                     onChange={() => onToggle(item.unit_id)}
                     className="h-4 w-4 rounded border-neutral-300 disabled:cursor-not-allowed disabled:opacity-40"
-                    aria-label={t("review.ariaSelect", { id: item.unit_id })}
+                    aria-label={t("review.ariaSelect", { id: title })}
                   />
                   <div className="min-w-0 flex-1">
-                    <div className="truncate font-mono text-xs text-neutral-900">
-                      {item.fingerprint.path}
-                    </div>
-                    <div className="truncate text-xs text-neutral-500">
-                      {primaryReason}
-                    </div>
+                    <div className="break-words text-sm font-semibold text-neutral-900">{title}</div>
+                    {session?.project?.cwd ? <p className="mt-1 truncate text-xs text-neutral-500" title={session.project.cwd}>{session.project.display_name || pathName(session.project.cwd)}</p> : null}
+                    <p className="mt-2 text-xs leading-5 text-neutral-600">{translateCleanupReason(primaryReason)}</p>
+                    <details className="mt-2 text-xs text-neutral-500"><summary className="cursor-pointer">{t("review.details")}</summary>
+                      <p className="mt-2 break-all font-mono">{item.fingerprint.path}</p>
+                      {session ? <p className="mt-1 break-all font-mono">{session.id}</p> : null}
+                      <ul className="mt-2 space-y-2">{item.reasons.filter(reason => reason !== primaryReason).map((reason, index) => <li key={index}>{translateCleanupReason(reason)}</li>)}</ul>
+                    </details>
                     {/* §6.3 per-item facts: operation mode + recoverability,
                         plus the contained resources for FileSet units. */}
                     <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-neutral-500">
@@ -369,7 +318,7 @@ export default function Review({
                             {item.locator.paths.map((member) => (
                               <li
                                 key={member}
-                                className="truncate font-mono text-[11px] text-neutral-400"
+                                className="break-all font-mono text-[11px] text-neutral-500"
                               >
                                 {member}
                               </li>

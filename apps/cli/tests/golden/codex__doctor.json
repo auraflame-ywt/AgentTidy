@@ -11,6 +11,14 @@
         "agent_running": "<AGENT_RUNNING>",
         "journal_modes": {},
         "problems": {
+          "codex-cleanup-cli": {
+            "message": "Codex CLI unavailable: cannot run codex --version (NotFound)",
+            "severity": "warning"
+          },
+          "codex-cleanup-recovery-unverified": {
+            "message": "Codex cleanup disabled: complete session recovery has not been validated (databases, transcript, index and attachments; §16.4)",
+            "severity": "warning"
+          },
           "thread-index-missing": {
             "message": "state_5.sqlite missing; JSONL-only scan will be degraded",
             "severity": "warning"

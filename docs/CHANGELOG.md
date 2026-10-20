@@ -14,12 +14,87 @@
 | Phase 2：Infrastructure | 已完成 | 安全文件系统、只读 SQLite、JSONL、空间统计、进程信号与回收站封装已实现。 |
 | Phase 3：三个 Read-only Provider | 已完成 | Codex、Claude Code（CLI/Desktop）和 WorkBuddy 均已具备安全降级的只读扫描。 |
 | Phase 4：CLI Validation | 已完成（只读初版） | CLI 已提供版本化 JSON 契约、文本诊断、真实扫描与 12 个端到端 golden；清理与候选预览保留给 Phase 6/7。 |
-| Phase 5：GUI Read-only Experience | 已完成（只读初版） | Tauri 2 IPC + React 三视图（Overview / Sessions / Diagnostics）已接入 Application API；清理与候选预览保留给 Phase 6/7。 |
-| Phase 6：Cleanup Model | 已完成（framework-only 初版） | 清理领域模型、策略、重新验证、审计日志、IPC 与 GUI Review 视图已落地；三个 provider 均未产出 Cleanup Unit，真实清理归 Phase 7。 |
-| Phase 7：首个 Provider Cleanup Beta | 进行中（代码切片全部落地） | 三个 provider 的清理切片均已落地：Claude Code transcript FileSet Beta、Codex archived-session `ProviderOperation` Beta（native `codex delete` 优先 + §12.4 自实现兜底）、WorkBuddy sessions v1 契约冻结 + FileSet Beta；Windows 锁定文件 `skipped` 分类已实现。剩余：小范围真实用户 Beta 与 Trash/Recovery/Compatibility 跨平台验证。 |
+| Phase 5：GUI Read-only Experience | 已完成，Mac 体验已优化 | 总览、会话搜索/筛选/详情、诊断已接入共享 API；已补齐占用排行、品牌图标、启动页与中英文展示。 |
+| Phase 6：Cleanup Model | 已完成，执行框架已加固 | 计划、TTL、完整证据重验、跨进程锁、审计、IPC 与两次确认已落地；具体资源清理资格及恢复验收归 Phase 7。 |
+| Phase 7：首个 Provider Cleanup Beta | 进行中（Mac 体验与安全加固已落地） | Claude Code / WorkBuddy FileSet Beta 已实现；Codex 仅保留 Blocked 候选，native delete 与 DB 替换均关闭。剩余：受控完整闭环、真实用户 Beta 与跨平台恢复/兼容性验收。 |
 | Phase 8：逐 Provider 扩展 | 未开始 | 按 Provider 分别通过安全门槛后推进。 |
 
-## 已完成里程碑
+## 2026-10-20 本轮总结（最新状态）
+
+本轮范围为 **Mac 本机检查、修复、使用路径优化和品牌升级**。默认只读、
+Trash-first、Fail-closed 的边界未放宽；没有清理真实会话，也没有执行
+Windows 真机验收。Phase 7 继续保持进行中。
+
+### 安全与执行修复
+
+- Codex 仅保留归档候选预览，始终 Blocked；直接 Provider 调用也拒绝执行。
+  native delete 和直接 DB 替换均关闭，避免将 SQLite 备份误当作完整会话恢复。
+- 同一物理数据库多选在任何修改前整批拒绝，覆盖 canonical 别名与硬链接；
+  单选不被未选中的行干扰。尚未实现协调式同库批量删除。
+- Codex CLI 缺失、探测失败、版本不符提前显示在预览与诊断；探测限定目标
+  CODEX_HOME，并设 3 秒超时与子进程取消，受支持版本也不能越过恢复门槛。
+- 经真实本机字段核对，将 Codex 秒级时间转换为领域毫秒，修正 1970 年日期、
+  排序及时间筛选；负数/溢出保持未知。
+- 完整证据、OS advisory lock、操作前审计、部分失败及 TTL 门禁继续生效。
+  原生 Trash 恢复使用临时样本验证，不将移入 Trash 的估算量冒充实际释放空间。
+
+### 产品与页面
+
+- 总览先呈现已识别占用、Agent 分布、诊断及最大会话入口；检查与扫描的诊断
+  合并去重，逻辑大小与可审查估算分开展示。
+- 会话列表保留搜索、Agent/生命周期/时间筛选与分页；新增原生详情侧栏，
+  展示项目、关联资源和处理条件；仅使用现有元数据，不读取正文猜标题。
+- 审查页优先展示会话/项目身份与生命周期理由，路径、计划 ID 和完整原因
+  按需展开。身份关联必须唯一，不从 unit ID 或共享数据库推断会话归属。
+- 本次处理回执只统计提交项；保留原位置、部分失败和手动恢复说明。
+  响应缺失时明确提示结果需核对，扫描刷新后仍保留本次身份；没有新增
+  跨重启的执行历史、自动恢复或虚假 Undo。
+
+### 品牌与启动
+
+- 新图标采用深石墨、银白折叠归档结构与翡翠绿点睛，统一 ICNS、ICO、桌面
+  PNG、favicon、工作台标识和启动页；移动端资源未更换。
+- 启动页采用同一视觉语言，显示真实扫描状态，可后台继续；就绪后短过渡
+  进入工作台，支持减弱动态效果，失败时可重试/查看诊断。
+- 点击工作台左上图标可重新打开品牌页，不触发新扫描、不重置清理状态。
+- 源图、导出脚本与最终 imagegen 提示词见
+  [品牌资源说明](../apps/desktop/assets/BRAND.md)。
+
+### 代码与验证
+
+- 分离只读扫描、清理和启动展示的状态模块；预览延迟至首次进入整理页，
+  导航保留筛选且不取消正在进行的执行；未新增前端运行依赖。
+- Rust 最近一次全工作区检查：**165 项通过、2 项 opt-in 默认忽略**；
+  fmt、Clippy（warnings denied）通过。
+- 品牌升级后前端：**17 项回归通过**，TypeScript/Vite 构建与 Tauri debug
+  `.app` 打包通过；图标透明通道、导出尺寸及包内 ICNS 一致性已核对。
+- 本机只读快照：3 个安装、354 个会话（Claude Code 26、Codex 19、WorkBuddy
+  309）。数量及运行状态随真实 Agent 活动变化，不作为固定验收值。
+- 本机只读探测与严格 Trash 临时样本恢复在本轮较早阶段分别显式通过，
+  不计入 165 项常规测试；后续品牌改动未重新运行严格 Trash 测试。
+- Mac 原生界面已核对总览跳转、侧栏、审查阻断、Codex 日期、品牌页与后台
+  继续；错误/响应缺失等组合由自动化覆盖，不冒充真实删除端到端验收。
+- 本机 pnpm 启动器存在签名校验/获取问题，使用已安装 Node 直接执行同等
+  TypeScript、Vite、测试及 Tauri 入口；未关闭签名验证或改 lockfile 绕过。
+
+### 尚未完成
+
+1. 受控 Provider 样本的完整 GUI 点击 → 执行 → 恢复 → 原 Agent 兼容性验收，
+   随后开展小范围真实用户 Beta。
+2. Codex 原生成功路径与数据库、transcript、索引、附件的完整恢复验证；
+   通过前维持 Blocked。同库协调批处理另行设计与验证。
+3. Mac 跨卷/外接盘恢复、TCC 权限场景、签名/公证发行包体验。
+4. Windows CI/真机清理与恢复单独推进；本轮结果不推导其通过。
+5. 后续工程整理：策略下沉 core、Application 模块化、Rust/TS 契约自动同步、
+   请求内只读事实复用。以上仍是待办，不属于本轮已完成项。
+
+详细场景、运行入口和边界见 [Mac 验收记录](./testing/macos-scenarios.md)。
+
+## 已完成里程碑（历史记录）
+
+以下按当时阶段保留实现演进与测试基线，不代表当前启用状态。尤其是旧锁
+接管机制、Codex native delete/数据库替换原型及早期测试数量，均以本页
+“本轮总结（最新状态）”和安全文档为准。
 
 ### Phase 0：Product & Provider Investigation
 
@@ -55,8 +130,8 @@
   Sessions 表格列出所有可识别 Session 及其 lifecycle / cwd / 大小；
   Diagnostics 折叠面板展示 inspection.problems / readable_roots /
   schema_versions / journal_modes / data_roots。
-- TS 类型在 `apps/desktop/src/types.ts` 手写对齐 Rust serde shape；`pnpm build:desktop`
-  的 `tsc -b` 步骤拦截 IPC 字段重命名与类型不匹配。自动 mount 扫描 + 手动 Refresh
+- TS 类型在 `apps/desktop/src/types.ts` 手写对齐 Rust serde shape；`tsc -b`
+  检查前端类型一致性，不能自动发现 Rust 字段重命名，仍需跨边界契约验证。自动 mount 扫描 + 手动 Refresh
   按钮；空安装路由到独立 `Empty` 面板，与 CLI 的空 envelope 契约对齐。
 - §6.3 Review & Tidy 在 Phase 6 交付（见下方 Phase 6 里程碑）；Phase 5 收官时
   GUI 仍不暴露执行入口。
@@ -178,7 +253,7 @@
   LowRisk（唯一晋升路径）；Inactive / 近期 Archived → ReviewRequired；
   无快照链接、非独占、带依赖 → Blocked。
 - 执行器：§12.1 跨进程 Operation guard（`$HOME/.agenttidy/operations.lock`，
-  阈值 10 分钟的 stale-lock 接管保障崩溃恢复）；`move_paths_to_trash`
+  当时采用 stale-lock 接管，后已由 OS advisory lock 取代，禁止按年龄抢锁）；`move_paths_to_trash`
   多路径移动 + §12.3 部分失败诚实聚合（moved 计数 + 原文错误，永不误报
   成功/丢失）；审计日志记录完整 `file-set` locator 与
   `estimated_reclaimable_bytes`。
@@ -200,7 +275,8 @@
 
 ### Phase 7 后续切片（2026-09-30）
 
-- **Codex `ProviderOperation` Beta**（`docs/safety/provider-operation.md`）：
+- **Codex `ProviderOperation` Beta 原型（已停用）**
+  （当前状态见 `docs/safety/provider-operation.md`；以下原型路径已移除）：
   `AgentProviderAdapter` 新增 `execute_provider_operation` trait 方法
   （默认 `Failed("not supported")`，不破坏未接入 provider）；Application
   层 `cleanup_execute` 的 `ProviderOperation` 分支从 Phase 6 stub 改为
@@ -237,27 +313,60 @@
   infrastructure（backup 3 项 + MutableSqliteDb 2 项 + fileset helper
   6 项 + lock 分类 1 项）、application（dispatch 契约 + 锁定聚合）。
 
+### Phase 7 执行链路加固（2026-10-20）
+
+- 去掉 Application 实例内安装缓存，执行时重新发现安装，修复独立 Tauri IPC
+  请求间 Codex ProviderOperation 找不到 installation 的问题。
+- Codex 指纹的 identity / mtime / size 全部来自数据库；执行前重新扫描、
+  构建单元、验证 Provider 安全约束并重算策略，活跃/Unknown/非独占/风险
+  变化或成员变化均跳过。Schema SQL / user_version / journal 与预览比较。
+- 预览携带 canonical paths 和递归成员指纹，覆盖 side directory、关联
+  rollout 与已有 DB sidecars；完整 item payload + expiry 纳入确认指纹。
+  操作锁先于重验证获取，每项执行前再验证，TTL 在重验证后再次检查。
+- SQLite 备份改为对只读源执行 VACUUM INTO，WAL 合并进独立快照，不再使用
+  文件拷贝兜底或覆盖已有备份；新增 live-WAL / recovery-point 回归测试。
+- Codex 仅接受调研版本 CLI，显式设置目标 CODEX_HOME，执行前备份 state 与
+  存在的 history DB。旧替换兜底未证明跨库 / WAL / Windows 恢复安全，已移除；
+  CLI 缺失、版本不符或失败时 fail-closed，不报告虚假的回收字节。
+- 增加独立实例 JSON 往返执行、审计/幂等、会话重激活、Schema/附件变化、
+  Provider 校验拒绝及 payload 修改回归；修复回收站失败场景中的测试假设。
+
+- 本机验证：`cargo fmt --all --check`、Clippy（warnings-as-errors）和
+  `cargo test --workspace` 全部通过（153 项）；前端直接执行 `tsc -b` +
+  `vite build` 通过。`pnpm build:desktop` 的启动器在获取指定 pnpm 版本时
+  registry signature verification 报 fetch failed，未将该命令记作通过。
+  本轮未执行真实用户数据清理，也未完成 Windows / 原生恢复验收。
+
+### 本机 Mac 场景补齐（2026-10-20）
+
+- 新增 [`testing/macos-scenarios.md`](./testing/macos-scenarios.md) 场景矩阵，
+  区分普通自动化、真实元数据只读检查、严格原生恢复及未验收项。
+- 修复 WorkBuddy 5.8.3 Electron 主进程漏报；本机三 Provider 当前均报告运行中，
+  实际 `.app` 的 337 个单元均阻断选择。353 个会话正常展示、可搜索和筛选。
+- NSFileManager 原生 Trash + 临时文件 / 嵌套目录恢复严格通过，覆盖中文、空格、
+  引号路径；不再依赖 Finder 脚本。Trash 移动 actual reclaimed_bytes=0。
+- Operation guard 改为 OS advisory lock，覆盖子进程竞争 / crash release / 老锁
+  不抢占；审计改为操作前打开 sink + fsync intent/result，半行恢复与权限失败有回归。
+- 无法验证的单元保留为 Blocked 行，不让整个预览失败，也不计入可处理字节。
+- GUI 增加会话搜索、Agent / 生命周期 / 时间过滤、排序与分页；清理期间禁用重复
+  请求与选择，过期弹窗自动失效，执行尝试后强制重新预览；常见阻断理由本地化。
+- Codex 原生 `--force UUID` 修复非交互提示问题，但本机合成样本试删仍失败；
+  原生成功 + 完整恢复保持未验收，数据库替换兜底关闭。Windows 留待后续。
+
+早期检查基线（已由页首最新结果更新）：fmt / Clippy 通过；Rust workspace 159 passed、2 ignored
+（本机 read-only probe 与严格 native Trash 测试均另行显式通过）；前端 7 项回归、
+类型检查与 Vite build 通过；本机 debug `.app` 打包及原生界面核对通过。
+Codex 原生成功 / 完整恢复验收仍保持打开。
+
 ## 下一步
 
-### Phase 7 收尾（剩余验收项）
+优先完成本页“尚未完成”第 1–3 项 Mac 验收，再决定清理能力的发布范围；
+不以增加 Provider 数量或视觉完成度替代恢复与真实用户验收。
+Phase 8 尚未启动，新资源继续遵循先安全文档、再样本/契约、后启用的流程。
 
-- 小范围真实用户 Beta 与 Trash/Recovery/Compatibility 跨平台验证
-  （Start.md §19 Phase 7 验收项；macOS 已绿，Windows 需 CI + 真机）。
-
-### Phase 8：逐 Provider 扩展（待启动）
-
-每个 Provider 独立通过安全门槛后开放 Cleanup（Start.md §19）；
-资源级启用流程沿用 Phase 7 的模板：先 `docs/safety/` 文档，再
-`build_cleanup_units` / `validate_cleanup_unit`，最后策略 per-kind 提权。
-
-### 验证前置问题
-
-- macOS 无 GUI / Finder 服务时，回收站功能会以 `TrashError::Platform` 失败；
-  单元测试会明确跳过原生回收站断言，生产调用仍保持 fail-closed。其余 Rust
-  测试与 Clippy 在当前环境通过。
-- 前端构建在受限会话下的不确定状态已解决：`pnpm build:desktop`（`tsc -b`
-  与 `vite build`）与 `cargo build -p agenttidy-desktop` 在当前会话下均能
-  干净通过；前端 build 不再是 Phase 5 验证的阻塞项。
+验证环境注意：普通 Rust 测试可能将原生 Trash 拒绝记录为平台失败，只有
+显式的严格原生测试通过才算该次恢复验收；前端 pnpm 启动器问题与构建结果
+分开记录，不能把 Node 直接入口通过写成 pnpm 命令已恢复。
 
 ## 维护约定
 
