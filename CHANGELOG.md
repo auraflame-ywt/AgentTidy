@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- macOS read-only Antigravity and Pi adapters, grounded in local metadata samples:
+  discovery, session/project listing, file usage and diagnostics through the shared
+  API, CLI and desktop. Antigravity multi-root associations remain visible without
+  arbitrary project attribution. Archive, cleanup and recovery remain unsupported.
+- Sanitized provider fixtures, WAL/schema/link boundary regressions and CLI coverage;
+  a shared desktop provider-label catalog prevents new sources inheriting another label.
+
 - **Phase 7 first cleanup slice — Claude Code transcript `FileSet` beta.**
   `build_cleanup_units` / `validate_cleanup_unit` now emit and validate
   atomic trash units (transcript + same-named side directory) for

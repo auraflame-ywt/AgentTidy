@@ -80,3 +80,18 @@ test('a missing execution response retains recovery references without inventing
   assert.match(html, /\/state\/db.sqlite/);
   assert.doesNotMatch(html, /0 completed/);
 });
+
+// New metadata-only sources must never inherit WorkBuddy labels or cleanup UI.
+test('Antigravity and Pi render their own labels and retain multiple workspaces', () => {
+  for (const [provider, label] of [['antigravity', 'Antigravity'], ['pi', 'Pi']]) {
+    const next = { ...session, provider, lifecycle: { state: 'unknown' }, project: null,
+      metadata: { workspace_uris: ['file:///Users/sample/a', 'file:///Users/sample/b'] } };
+    const nextSnapshot = { ...snapshot, installation: { ...installation, provider }, sessions: [next], resources: [] };
+    const html = render(SessionDetail, { snapshot: nextSnapshot, session: next, plan: { ...plan, items: [] } });
+    assert.match(html, new RegExp(label));
+    assert.match(html, /Associated workspaces \(2\)/);
+    assert.match(html, /file:\/\/\/Users\/sample\/a/);
+    assert.doesNotMatch(html, />WorkBuddy</);
+    assert.equal(view.sessionCleanupItems(nextSnapshot, next, { ...plan, items: [] }).length, 0);
+  }
+});

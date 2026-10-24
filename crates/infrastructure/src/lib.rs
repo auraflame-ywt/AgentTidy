@@ -17,6 +17,7 @@
 //! - §3.4 trash-first disposal — [`trash`]
 //! - §12.1 operation guard — [`operation_guard`]
 
+pub mod atomic_file;
 pub mod audit_log;
 pub mod backup;
 pub mod disk_usage;

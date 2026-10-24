@@ -1,12 +1,13 @@
 // Decision-oriented storage overview (Start.md §6.1). Measured resource
 // footprint and plan estimates stay separate; neither promises freed space.
+import { providerKeys } from "../provider-catalog";
 import { humanBytes, formatDateTime } from "../format";
 import { useI18n } from "../i18n";
 import { diagnosticCount, storageSummary } from "../presentation";
 import { usePlanExpired } from "../usePlanExpired";
 import type { AgentSnapshot, CleanupPlan, DoctorReport, ProviderId } from "../types";
 
-const providerKeys = { "claude-code": "provider.claudeCode", codex: "provider.codex", workbuddy: "provider.workbuddy" } as const;
+
 interface OverviewProps {
   reports: DoctorReport[]; snapshots: AgentSnapshot[]; plan: CleanupPlan | null;
   loading: boolean; onBrowse: (provider?: ProviderId) => void;

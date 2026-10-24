@@ -20,7 +20,9 @@ See [`Start.md`](./Start.md) for the full v0.1 design document (Chinese).
 
 Pre-release, **Phase 7 cleanup Beta under validation**. Read-only detection,
 scanning, sessions and diagnostics are implemented for **WorkBuddy**,
-**Claude Code** and **Codex**, through a shared Rust API, CLI and Tauri GUI.
+**Claude Code**, **Codex**, **Antigravity** and **Pi**, through a shared Rust API,
+CLI and Tauri GUI. Antigravity / Pi currently support macOS read-only analysis;
+see [provider scope](docs/providers/antigravity.md) and [Pi scope](docs/providers/pi.md).
 Claude Code / WorkBuddy session file sets support guarded Trash cleanup;
 Codex archived-session candidates remain Blocked until native deletion and
 complete session recovery pass acceptance; CLI admission is shown in preview
@@ -73,7 +75,7 @@ See [project progress](./docs/CHANGELOG.md) and the
 apps/desktop/    Tauri 2 + React desktop GUI
 apps/cli/        agenttidy CLI
 crates/          Rust core, application API, infrastructure, provider contracts
-providers/       Per-agent adapters (workbuddy, claude-code, codex)
+providers/       Per-agent adapters (workbuddy, claude-code, codex, antigravity, pi)
 fixtures/        Sanitized test fixtures
 docs/            Provider investigation docs, safety notes, ADRs
 ```

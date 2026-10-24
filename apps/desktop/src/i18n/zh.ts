@@ -20,7 +20,7 @@ export const zh: Record<TranslationKey, string> = {
   // --- Empty state ---
   "empty.title": "未检测到受支持的 Agent 安装",
   "empty.body":
-    "AgentTidy 会在本机查找 Codex、Claude Code 和 WorkBuddy。安装其中之一，或以更高权限运行，即可在此看到检测结果。",
+    "AgentTidy 会在本机查找 Codex、Claude Code、WorkBuddy、Antigravity 和 Pi。使用其中一个 Agent 后刷新；数据无法访问时可查看诊断。",
 
   // --- Overview ---
   "overview.noInstallations": "尚未检测到任何安装，试试刷新。",
@@ -67,6 +67,21 @@ export const zh: Record<TranslationKey, string> = {
   "provider.claudeCode": "Claude Code",
   "provider.codex": "Codex",
   "provider.workbuddy": "WorkBuddy",
+  "provider.antigravity": "Antigravity",
+  "provider.pi": "Pi",
+  "problem.pi-sessions-unavailable": "Pi 会话目录缺失、不可读或为符号链接",
+  "problem.pi-header": "Pi 会话头不可读或格式不受支持：",
+  "problem.pi-duplicate": "Pi 会话标识重复，重复项未归属：",
+  "problem.pi-walk": "Pi 文件枚举不完整：",
+  "problem.antigravity-index-unavailable": "Antigravity 会话索引不可读或结构不兼容，未猜测会话归属",
+  "problem.antigravity-index-row": "Antigravity 索引中有不可读记录",
+  "problem.antigravity-invalid-id": "Antigravity 会话标识不受支持：",
+  "problem.antigravity-directory": "Antigravity 资源目录缺失、不可读或为符号链接：",
+  "problem.antigravity-transcript-missing": "Antigravity 索引未找到对应的可读会话正文：",
+  "problem.antigravity-workspaces": "工作区关联格式不受支持：",
+  "problem.antigravity-walk": "Antigravity 文件枚举不完整：",
+  "problem.antigravity-unindexed-files": "Antigravity 存在未索引文件，默认不归属到会话；启用 include_unknown 可统计这些未知资源",
+  "detail.workspaces": "关联工作区（{count}）",
   "platform.macos": "macOS",
   "platform.windows": "Windows",
 

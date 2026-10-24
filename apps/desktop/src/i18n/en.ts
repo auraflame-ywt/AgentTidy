@@ -30,7 +30,7 @@ export const en = {
   // --- Empty state ---
   "empty.title": "No supported agent installations detected",
   "empty.body":
-    "AgentTidy looks for Codex, Claude Code, and WorkBuddy on this machine. Use one of these agents, then refresh. If its data is inaccessible, check Diagnostics.",
+    "AgentTidy looks for Codex, Claude Code, WorkBuddy, Antigravity, and Pi on this machine. Use one of these agents, then refresh. If its data is inaccessible, check Diagnostics.",
 
   // --- Overview ---
   "overview.noInstallations": "No installations detected yet. Try Refresh.",
@@ -77,6 +77,21 @@ export const en = {
   "provider.claudeCode": "Claude Code",
   "provider.codex": "Codex",
   "provider.workbuddy": "WorkBuddy",
+  "provider.antigravity": "Antigravity",
+  "provider.pi": "Pi",
+  "problem.pi-sessions-unavailable": "Pi session directory is unavailable or linked",
+  "problem.pi-header": "Pi session header is unreadable or unsupported",
+  "problem.pi-duplicate": "Duplicate Pi session id; left unattributed",
+  "problem.pi-walk": "Incomplete Pi file enumeration",
+  "problem.antigravity-index-unavailable": "Antigravity conversation index is unavailable or incompatible",
+  "problem.antigravity-index-row": "Antigravity index row is unreadable",
+  "problem.antigravity-invalid-id": "Unsupported Antigravity conversation id",
+  "problem.antigravity-directory": "Antigravity resource directory is missing, unreadable or linked",
+  "problem.antigravity-transcript-missing": "No readable matching Antigravity transcript",
+  "problem.antigravity-workspaces": "Unsupported workspace URI metadata",
+  "problem.antigravity-walk": "Incomplete Antigravity file enumeration",
+  "problem.antigravity-unindexed-files": "Unindexed Antigravity files exist; enable include_unknown to measure",
+  "detail.workspaces": "Associated workspaces ({count})",
   "platform.macos": "macOS",
   "platform.windows": "Windows",
 

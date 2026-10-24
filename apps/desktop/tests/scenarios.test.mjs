@@ -81,3 +81,12 @@ test('Codex admission explains recovery and CLI blockers before confirmation', (
     assert.equal(reasons.cleanupReasonKey(`${recovery}; ${cli} details`), 'cleanup.reason.codexRecoveryCli');
   }
 });
+
+test('provider filters isolate Pi and Antigravity in a mixed session list', () => {
+  const sources = [...rows, row('pi-session', 'pi', 'unknown', now, 1, '/pi'),
+    row('agy-session', 'antigravity', 'unknown', now, 2, null)];
+  for (const [provider, id] of [['pi', 'pi-session'], ['antigravity', 'agy-session']]) {
+    assert.deepEqual(sessions.querySessions(sources, { ...sessions.DEFAULT_SESSION_QUERY, provider }, now)
+      .map(row => row.session.id), [id]);
+  }
+});

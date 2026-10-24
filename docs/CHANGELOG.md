@@ -17,9 +17,26 @@
 | Phase 5：GUI Read-only Experience | 已完成，Mac 体验已优化 | 总览、会话搜索/筛选/详情、诊断已接入共享 API；已补齐占用排行、品牌图标、启动页与中英文展示。 |
 | Phase 6：Cleanup Model | 已完成，执行框架已加固 | 计划、TTL、完整证据重验、跨进程锁、审计、IPC 与两次确认已落地；具体资源清理资格及恢复验收归 Phase 7。 |
 | Phase 7：首个 Provider Cleanup Beta | 进行中（Mac 体验与安全加固已落地） | Claude Code / WorkBuddy FileSet Beta 已实现；Codex 仅保留 Blocked 候选，native delete 与 DB 替换均关闭。剩余：受控完整闭环、真实用户 Beta 与跨平台恢复/兼容性验收。 |
-| Phase 8：逐 Provider 扩展 | 未开始 | 按 Provider 分别通过安全门槛后推进。 |
+| Phase 8：逐 Provider 扩展 | 已开始（Mac 只读） | Antigravity / Pi 会话、项目、占用与诊断已接入；清理/归档/恢复和 Windows 等待各自安全门槛。 |
 
-## 2026-10-20 本轮总结（最新状态）
+## 2026-10-21 Antigravity / Pi 扩展（最新状态）
+
+- 基于本机真实样本新增两个静态 Provider，贯通 Rust Application API、CLI 与桌面。
+  macOS 默认路径检测；Pi 支持 agent/session 目录环境变量。
+- Antigravity 只读取索引元数据并测量 `.pb` / brain 产物，支持单项目路径映射与
+  多工作区详情；Pi 只读取有大小上限的 v3 header，不解析后续消息正文。
+- 新来源统一标签与筛选，补齐中英文来源名称和空状态说明。原有清理能力未扩展。
+- 两者均保持生命周期/归属 Unknown，不创建 cleanup unit，不启用归档、删除或恢复。
+  Windows 尚未调查与验收。Phase 7 现有恢复/用户验收阻塞不因扩展而关闭。
+- 本机只读扫描：Antigravity 50 条会话（4 条索引缺少对应可读正文，另有未索引文件
+  提示）、Pi 3 条会话；未执行真实数据清理。
+- 实样来源、格式边界和测试说明见 `docs/providers/antigravity.md` 与
+  `docs/providers/pi.md`，脱敏样本位于 `fixtures/antigravity`、`fixtures/pi`。
+- 验证：Rust 工作区 179 项通过、2 项原有测试默认忽略；fmt、clippy（warnings
+  视为错误）、TypeScript/Vite 构建和 19 项前端测试通过。新增来源 CLI 端到端通过；
+  已生成包含两类来源的 macOS Debug `.app`。
+
+## 2026-10-20 Mac 检查与品牌升级总结
 
 本轮范围为 **Mac 本机检查、修复、使用路径优化和品牌升级**。默认只读、
 Trash-first、Fail-closed 的边界未放宽；没有清理真实会话，也没有执行

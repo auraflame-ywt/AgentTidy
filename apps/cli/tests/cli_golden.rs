@@ -129,6 +129,8 @@ fn run_cli(command: &str, home: &Path) -> CliOutput {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("LOCALAPPDATA", home)
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("PI_CODING_AGENT_SESSION_DIR")
         // Never run the developer's installed CLI during fixture snapshots.
         // The missing-binary diagnostic is stable across local/CI machines.
         .env("PATH", home.join("empty-bin"))

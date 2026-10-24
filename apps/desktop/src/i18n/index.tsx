@@ -81,6 +81,14 @@ const DYNAMIC_CODE_STEMS = [
   "archive-state-mismatch",
   "project-unreadable",
   "workspace-unreadable",
+  "pi-header",
+  "pi-duplicate",
+  "pi-walk",
+  "antigravity-invalid-id",
+  "antigravity-directory",
+  "antigravity-transcript-missing",
+  "antigravity-workspaces",
+  "antigravity-walk",
 ] as const;
 
 function lookup(

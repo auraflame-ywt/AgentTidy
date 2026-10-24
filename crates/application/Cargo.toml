@@ -11,6 +11,8 @@ agenttidy-core = { workspace = true }
 agenttidy-infrastructure = { workspace = true }
 agenttidy-provider-api = { workspace = true }
 agenttidy-codex = { workspace = true }
+agenttidy-pi = { workspace = true }
+agenttidy-antigravity = { workspace = true }
 agenttidy-claude-code = { workspace = true }
 agenttidy-workbuddy = { workspace = true }
 anyhow = { workspace = true }

@@ -9,13 +9,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agenttidy-antigravity"
+version = "0.1.0"
+dependencies = [
+ "agenttidy-core",
+ "agenttidy-infrastructure",
+ "agenttidy-provider-api",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "agenttidy-application"
 version = "0.1.0"
 dependencies = [
+ "agenttidy-antigravity",
  "agenttidy-claude-code",
  "agenttidy-codex",
  "agenttidy-core",
  "agenttidy-infrastructure",
+ "agenttidy-pi",
  "agenttidy-provider-api",
  "agenttidy-workbuddy",
  "anyhow",
@@ -49,6 +69,7 @@ dependencies = [
  "anyhow",
  "clap",
  "comfy-table",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
@@ -102,6 +123,20 @@ dependencies = [
  "trash",
  "walkdir",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "agenttidy-pi"
+version = "0.1.0"
+dependencies = [
+ "agenttidy-core",
+ "agenttidy-infrastructure",
+ "agenttidy-provider-api",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

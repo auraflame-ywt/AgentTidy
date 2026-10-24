@@ -163,10 +163,9 @@ pub trait AgentProviderAdapter: Send + Sync {
     ///
     /// Default returns `Failed` so providers that have not opted into
     /// `ProviderOperation` keep the legacy "not wired" behaviour
-    /// without breaking dispatch. The item's `record_id` and
-    /// `database` are read from `item.locator` (which the plan-build
-    /// pipeline guarantees is a `CleanupLocator::DbRow` for this
-    /// action).
+    /// without breaking dispatch. A provider may use a DbRow locator or an
+    /// explicitly validated FileSet for a coordinated multi-store operation;
+    /// only the provider interprets its membership, never the shell.
     async fn execute_provider_operation(
         &self,
         item: &agenttidy_core::cleanup::CleanupItem,

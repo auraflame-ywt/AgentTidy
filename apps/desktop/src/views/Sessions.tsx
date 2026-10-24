@@ -8,6 +8,7 @@
 // found." branch. i18n: headers, lifecycle labels and the empty state go
 // through `useI18n().t`; timestamps are locale-formatted.
 
+import { providerKeys } from "../provider-catalog";
 import { useState } from "react";
 import { DEFAULT_SESSION_QUERY, querySessions, sessionRows, type SessionQuery } from "../session-query";
 import { formatDateTime, humanBytes } from "../format";
@@ -107,9 +108,7 @@ export default function Sessions({ snapshots, plan, query, onQueryChange, onRevi
           <select value={query.provider} onChange={event => setFilter({ provider: event.target.value as SessionQuery["provider"] })}
             className="mt-1 block rounded-md border border-neutral-300 px-2 py-2 text-sm">
             <option value="all">{t("sessions.filter.all")}</option>
-            <option value="claude-code">{t("provider.claudeCode")}</option>
-            <option value="codex">{t("provider.codex")}</option>
-            <option value="workbuddy">{t("provider.workbuddy")}</option>
+            {Object.entries(providerKeys).map(([id, key]) => <option key={id} value={id}>{t(key)}</option>)}
           </select>
         </label>
         <label className="text-xs text-neutral-600">{t("sessions.col.lifecycle")}
@@ -160,7 +159,7 @@ export default function Sessions({ snapshots, plan, query, onQueryChange, onRevi
                 className="border-b border-neutral-100 last:border-b-0"
               >
                 <td className="px-4 py-2 font-mono text-xs text-neutral-700">
-                  {session.provider === "claude-code" ? t("provider.claudeCode") : session.provider === "codex" ? t("provider.codex") : t("provider.workbuddy")}
+                  {t(providerKeys[session.provider])}
                 </td>
                 <td className="px-4 py-2 font-mono text-xs text-neutral-900">
                   <button type="button" onClick={() => setOpened({ installation, id: session.id })}

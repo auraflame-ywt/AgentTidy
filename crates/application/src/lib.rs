@@ -7,6 +7,7 @@
 //! Phase 4 wires the fixed v0.1 provider set here. Neither the GUI nor the
 //! CLI may bypass this layer and touch providers or the filesystem directly.
 
+use agenttidy_antigravity::AntigravityAdapter;
 use agenttidy_claude_code::ClaudeCodeAdapter;
 use agenttidy_codex::CodexAdapter;
 use agenttidy_core::{
@@ -23,6 +24,7 @@ use agenttidy_infrastructure::{
     paths::safe_canonicalize,
     trash::{self, PathTrashResult, TrashError, TrashOutcome},
 };
+use agenttidy_pi::PiAdapter;
 use agenttidy_provider_api::{AgentProviderAdapter, ProviderInspection};
 use agenttidy_workbuddy::WorkBuddyAdapter;
 use serde::Serialize;
@@ -89,6 +91,15 @@ impl Application {
                 Box::new(WorkBuddyAdapter),
             )
             .expect("WorkBuddy registers once");
+        providers
+            .register(ProviderId::new(ProviderId::PI), Box::new(PiAdapter))
+            .expect("Pi registers once");
+        providers
+            .register(
+                ProviderId::new(ProviderId::ANTIGRAVITY),
+                Box::new(AntigravityAdapter),
+            )
+            .expect("Antigravity registers once");
         Self { providers }
     }
 
@@ -1018,7 +1029,12 @@ fn validate_database_batch(plan: &CleanupPlan, selected: &[String]) -> anyhow::R
         if !selected.contains(&item.unit_id) {
             continue;
         }
-        if let agenttidy_core::CleanupLocator::DbRow { database, .. } = &item.locator {
+        // A coordinated FileSet may contain a shared DB/cache as its primary
+        // state object too. Serialize every provider operation on that identity.
+        if item.action == CleanupAction::ProviderOperation {
+            let Some(database) = item.locator.paths().first().copied() else {
+                anyhow::bail!("empty provider operation locator");
+            };
             let canonical = safe_canonicalize(database)?;
             let identity = agenttidy_infrastructure::fs_probe::file_identity(&canonical)
                 .ok_or_else(|| anyhow::anyhow!("cannot identify selected database"))?;
@@ -1477,9 +1493,18 @@ mod tests {
     }
 
     #[test]
-    fn static_registry_contains_the_three_v01_providers() {
+    fn static_registry_contains_all_verified_provider_adapters() {
         let app = Application::new();
-        assert_eq!(app.providers.len(), 3);
+        assert_eq!(app.providers.len(), 5);
+        for id in [
+            ProviderId::CLAUDE_CODE,
+            ProviderId::CODEX,
+            ProviderId::WORKBUDDY,
+            ProviderId::ANTIGRAVITY,
+            ProviderId::PI,
+        ] {
+            assert!(app.providers.get(&ProviderId::new(id)).is_some());
+        }
     }
 
     fn snapshot_with_workspace(

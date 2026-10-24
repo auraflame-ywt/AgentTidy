@@ -325,6 +325,22 @@ pub fn identities_of(entries: &[EntryInfo]) -> HashSet<FileIdentity> {
     entries.iter().filter_map(|e| e.identity).collect()
 }
 
+/// A cleanup-owned file must have no other hard-link aliases (§8 / §16.1).
+/// Uninvestigated platforms cannot establish this fact and fail closed.
+pub fn is_single_link_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.nlink() == 1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

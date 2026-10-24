@@ -1,5 +1,6 @@
 // Session-oriented review (Start.md §6.3 / §12). Identity is a display-only
 // join to snapshot metadata; risk, membership and admission remain backend facts.
+import { providerKeys } from "../provider-catalog";
 import ExecutionResults from "./ExecutionResults";
 import { cleanupSession, pathName, primaryCleanupReason, sessionTitle } from "../presentation";
 import { planExpired } from "../cleanup-flow";
@@ -44,14 +45,7 @@ function riskBadge(
 }
 
 function providerLabel(provider: ProviderId, t: Translate): string {
-  switch (provider) {
-    case "claude-code":
-      return t("provider.claudeCode");
-    case "codex":
-      return t("provider.codex");
-    case "workbuddy":
-      return t("provider.workbuddy");
-  }
+  return t(providerKeys[provider]);
 }
 
 interface ReviewProps {

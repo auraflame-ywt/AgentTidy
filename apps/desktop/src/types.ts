@@ -14,7 +14,7 @@
 // --- Provider & installation ---
 
 /** `crates/core/src/provider.rs`: closed set, serde as bare string. */
-export type ProviderId = "claude-code" | "codex" | "workbuddy";
+export type ProviderId = "claude-code" | "codex" | "workbuddy" | "antigravity" | "pi";
 
 /** `crates/core/src/installation.rs`: `#[serde(rename_all = "lowercase")]`. */
 export type Platform = "macos" | "windows";

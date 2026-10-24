@@ -1,0 +1,7 @@
+{
+  "conversation_id": "00000000-0000-4000-8000-000000000002",
+  "title": "Sanitized session",
+  "last_modified_time": "2026-02-03 01:14:51.153367+00:00",
+  "workspace_uris": "[\"file:///Users/sample/project0\", \"file:///Users/sample/project1\", \"file:///Users/sample/project2\", \"file:///Users/sample/project3\"]",
+  "status": "CASCADE_RUN_STATUS_IDLE"
+}
