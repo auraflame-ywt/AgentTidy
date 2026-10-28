@@ -370,13 +370,14 @@ async fn unsafe_unit_becomes_a_blocked_preview_row() {
 /// Opt-in read-only local probe: reports counts only, never executes a plan
 /// or prints session paths, titles or message content. It runs against actual
 /// installations to catch cross-provider admission failures hidden by mocks.
+///
+/// Platform-neutral by design: it probes whatever providers the host
+/// actually has, so Windows runs the same admission checks the Mac
+/// developer machine does (D12 — the macOS-only gate hid exactly this
+/// kind of cross-provider failure on Windows).
 #[tokio::test]
 #[ignore = "reads local provider metadata; never mutates or cleans real data"]
-async fn local_macos_readonly_scan_and_preview() {
-    assert_eq!(
-        agenttidy_infrastructure::paths::host_platform(),
-        agenttidy_core::Platform::Macos
-    );
+async fn local_readonly_scan_and_preview() {
     let app = Application::new();
     let snapshots = app.scan(&ScanOptions::default()).await.unwrap();
     let plan = app.cleanup_plan_from_snapshots(&snapshots).await.unwrap();

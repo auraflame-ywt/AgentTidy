@@ -1,14 +1,16 @@
-# Antigravity：macOS 只读接入
+# Antigravity：macOS / Windows 只读接入
 
-调查日期：2026-10-21。本机安装 Antigravity 2.24.0 和 Antigravity IDE 2.5.5；
-本轮接入已观察到的 `~/.gemini/antigravity` 状态目录，按数据根报告一次安装，
-不把两个 app bundle 重复计入。其他版本、其他目录与 Windows 尚未验证。
+调查日期：2026-10-21（macOS）、2026-10-28（Windows）。macOS 本机安装 Antigravity 2.24.0
+和 Antigravity IDE 2.5.5；Windows 本机安装同款（`%LOCALAPPDATA%\Programs\antigravity`、
+`%LOCALAPPDATA%\Programs\Antigravity IDE`）。本轮接入已观察到的 `~/.gemini/antigravity`
+状态目录，按数据根报告一次安装，不把两个 app bundle 重复计入。其他版本与其他目录尚未验证。
 对应 `Start.md` §10、§18、§22。
 
 ## 已验证结构
 
-- `conversation_summaries.db`：真实 `conversation_summaries` 表的 50 条索引。
-  仅投影 conversation_id、title、last_modified_time、workspace_uris、status。
+- `conversation_summaries.db`：真实 `conversation_summaries` 表的 50 条索引（macOS）
+  / 12 条索引（Windows）。仅投影 conversation_id、title、last_modified_time、
+  workspace_uris、status、parent_conversation_id、not_fully_idle。
   不读取 preview、raw_summary 或含正文的 FTS 表。
 - `conversations/<UUID>.pb`：二进制正文，不解码；只测量文件大小。
 - `brain/<UUID>/...`：按相同索引 id 关联的产物文件，只枚举和测量，不读取正文。
@@ -18,6 +20,24 @@
 
 索引 id 必须符合 UUID 形状，不能控制根目录；读取范围固定为上述已验证目录。
 所有树遍历不跟随链接，硬链接按物理 identity 去重。
+
+## Windows 观察结果（2026-10-28）
+
+Windows 样本与 macOS **同构**，状态根同为 `~/.gemini/antigravity`，已验证目录
+（`conversation_summaries.db`、`conversations/<UUID>.pb`、`brain/<UUID>/...`、
+`annotations/`）逐项对应；适配器使用的投影查询在 Windows 库上原样可跑。
+两处差异已写入代码与回归：
+
+- **`title` 在 Windows 上为空字符串**（12 行全部为空；macOS 有真实标题）。
+  空标题必须降级为"无标题"，不能显示成空白标题。
+- **`workspace_uris` 在 Windows 上带盘符**：`file:///c%3A/Sample/project`，
+  `Url::to_file_path()` 解码为 `c:\Sample\project`；macOS 形态的
+  `/Users/...` URI 在 Windows 上解不出路径，属预期差异。
+
+`status` 在两端同为 `CASCADE_RUN_STATUS_IDLE`，仍不证明会话可清理，生命周期保持 Unknown。
+Windows 侧只读验收：12 条索引、760 个已纳入资源；无诊断，未修改或清理真实会话。
+脱敏实样见 `fixtures/antigravity/index/row-windows.json` 与
+`fixtures/antigravity/index/README-windows.md`。
 
 ## 映射与降级
 

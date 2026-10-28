@@ -28,6 +28,18 @@ Archive / RestoreArchive / Cleanup / Cache / Logs 不支持。
 不读取 auth.json、settings.json、models.json 或会话正文，不运行 Pi CLI。
 符号链接根和会话目录不扫描，树内符号链接不跟随。
 
+### Windows 状态：保持关闭
+
+2026-10-28 在 Windows 开发机核验：本机**没有安装** Pi
+（`%USERPROFILE%\.pi` 不存在，PATH 与 npm 全局目录也没有 `pi`），因此
+**没有任何 Windows 样本**。按仓库红线（先有样本，再改代码），Windows 上的
+`discover()` 继续返回 `None`，该 provider 在 Windows 上完全不可见，而不是
+"按 macOS 路径猜测"。
+
+取得 Windows 样本后需要做的事：确认 agent root 与会话目录布局是否与
+`~/.pi/agent` + `sessions/<project-dir>/*.jsonl` 同构；补脱敏 fixture；在
+`docs/providers/pi.md` 增加 Windows 段落；再放开 `discover()` 的平台门禁。
+
 脱敏实样：`fixtures/pi/sessions/header.jsonl`（id/cwd 已替换、正文未保留）。
 覆盖：真实 header 映射、正文不解析、格式变更/超限、重复 id、独立会话根、
 链接边界、只读能力和 CLI 默认/环境目录发现。

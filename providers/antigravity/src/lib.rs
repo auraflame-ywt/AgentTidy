@@ -54,21 +54,31 @@ fn regular(path: &Path) -> bool {
 impl AntigravityAdapter {
     fn running() -> bool {
         any_process_running(&[ProcessSignature::new(
+            // The executable stem matches on both platforms: macOS ships
+            // `Antigravity`/`Antigravity IDE`, Windows ships
+            // `Antigravity.exe` (the extension is ignored by the
+            // matcher).
             &["Antigravity", "Antigravity IDE", "language_server"],
-            &["Antigravity.app", "Antigravity IDE.app"],
+            // The macOS bundle path and the Windows install directory
+            // both identify the agent when the executable name is
+            // generic (`Electron`-style hosts).
+            &[
+                "Antigravity.app",
+                "Antigravity IDE.app",
+                "programs/antigravity",
+                "programs/antigravity ide",
+            ],
         )])
     }
 
     /// Report the observed state root once, irrespective of installed app bundles.
+    ///
+    /// The state root is the same on both platforms: `~/.gemini/antigravity`.
+    /// Verified on macOS (Antigravity 2.24.0 / IDE 2.5.5) and on Windows
+    /// (same directory tree: `conversation_summaries.db`, `conversations/<UUID>.pb`,
+    /// `brain/<UUID>/...`).
     fn discover() -> Option<PathBuf> {
-        #[cfg(target_os = "macos")]
-        {
-            agenttidy_infrastructure::paths::home_dir().map(|h| h.join(".gemini/antigravity"))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
+        agenttidy_infrastructure::paths::home_dir().map(|h| h.join(".gemini/antigravity"))
     }
     fn root(installation: &AgentInstallation) -> anyhow::Result<&Path> {
         let root = Path::new(
@@ -688,6 +698,46 @@ mod tests {
                 .as_deref(),
             Some("/Users/sample/My Project")
         );
+    }
+
+    /// A Windows host stores the workspace URI with a drive letter
+    /// (`file:///c%3A/...`), and every row of the observed Windows index
+    /// carries an **empty** title. The URI must decode to a usable
+    /// Windows path and the empty title must degrade to "no title" —
+    /// never a blank title the user would read as a rendering bug.
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_uri_decodes_and_an_empty_title_degrades() {
+        let sample = Sample::new();
+        let db = rusqlite::Connection::open(sample.0.join(INDEX)).unwrap();
+        db.execute(
+            "UPDATE conversation_summaries SET workspace_uris=?1, title=''",
+            [r#"["file:///c%3A/Sample/project"]"#],
+        )
+        .unwrap();
+        drop(db);
+        let session = &sample.scan().sessions[0];
+        assert_eq!(
+            session.project.as_ref().unwrap().cwd.as_deref(),
+            Some(r"c:\Sample\project"),
+            "a Windows drive-letter URI must decode to a Windows path"
+        );
+        assert_eq!(
+            session.title, None,
+            "an empty index title must degrade to no title"
+        );
+    }
+
+    /// The empty-title rule holds on every platform: a row whose title
+    /// is the empty string must not surface as a blank title.
+    #[test]
+    fn an_empty_index_title_degrades_to_no_title() {
+        let sample = Sample::new();
+        let db = rusqlite::Connection::open(sample.0.join(INDEX)).unwrap();
+        db.execute("UPDATE conversation_summaries SET title=''", [])
+            .unwrap();
+        drop(db);
+        assert_eq!(sample.scan().sessions[0].title, None);
     }
     #[test]
     fn missing_index_and_changed_schema_degrade_instead_of_guessing_sessions() {

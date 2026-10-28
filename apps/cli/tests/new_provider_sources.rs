@@ -1,8 +1,12 @@
-//! macOS end-to-end coverage for investigated read-only providers (§18, §22).
+//! End-to-end coverage for investigated read-only providers (§18, §22).
 //! Real sanitized metadata flows through discovery, the static Application
 //! registry and the CLI wire contract; no developer data root is consulted.
-#![cfg(target_os = "macos")]
-
+//!
+//! Platform-neutral by design: the test drives the providers through
+//! environment variables and a temporary home, so Windows runs the same
+//! wire-contract coverage the Mac developer machine does (D12). The one
+//! exception is Pi, which has no Windows sample yet — until one exists
+//! its discovery stays disabled there (red line: samples before code).
 use serde_json::Value;
 use std::{
     fs,
@@ -56,6 +60,10 @@ impl Drop for Home {
     }
 }
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi has no Windows sample yet; its discovery stays disabled there"
+)]
 fn pi_default_and_configured_roots_reach_the_public_api() {
     for configured in [false, true] {
         let home = Home::new();
