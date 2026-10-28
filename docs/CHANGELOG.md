@@ -16,10 +16,67 @@
 | Phase 4：CLI Validation | 已完成（只读初版） | CLI 已提供版本化 JSON 契约、文本诊断、真实扫描与 12 个端到端 golden；清理与候选预览保留给 Phase 6/7。 |
 | Phase 5：GUI Read-only Experience | 已完成，Mac 体验已优化 | 总览、会话搜索/筛选/详情、诊断已接入共享 API；已补齐占用排行、品牌图标、启动页与中英文展示。 |
 | Phase 6：Cleanup Model | 已完成，执行框架已加固 | 计划、TTL、完整证据重验、跨进程锁、审计、IPC 与两次确认已落地；具体资源清理资格及恢复验收归 Phase 7。 |
-| Phase 7：首个 Provider Cleanup Beta | 进行中（Mac 体验与安全加固已落地） | Claude Code / WorkBuddy FileSet Beta 已实现；Codex 仅保留 Blocked 候选，native delete 与 DB 替换均关闭。剩余：受控完整闭环、真实用户 Beta 与跨平台恢复/兼容性验收。 |
-| Phase 8：逐 Provider 扩展 | 已开始（Mac 只读，Windows 对齐进行中） | Antigravity / Pi 会话、项目、占用与诊断已接入；清理/归档/恢复和 Windows 等待各自安全门槛。 |
+| Phase 7：首个 Provider Cleanup Beta | 进行中（Mac 与 Windows 均已受控验收） | Claude Code / WorkBuddy FileSet Beta 已实现；Codex 仅保留 Blocked 候选，native delete 与 DB 替换均关闭。Windows 上已完成受控合成样本的"发现 → 计划 → 重验 → 移入回收站 → 手动恢复"完整闭环验收。剩余：真实用户 Beta、发行包与签名体验。 |
+| Phase 8：逐 Provider 扩展 | 已开始（Windows 只读已对齐） | Antigravity 已在 Windows 接入（样本同构、空标题降级、盘符 URI 均有回归）；Pi 在 Windows 保持关闭（本机无安装、无样本）。清理/归档/恢复仍等待各自安全门槛。 |
 
-## 2026-10-24 Windows 对齐 macOS 计划（最新状态）
+## 2026-10-28 Windows 对齐 macOS：执行结果（最新状态）
+
+本轮把 Windows 从"CI 红灯 + 静默丢数据"推进到"与 macOS 同门禁、同语义"，
+并完成 Phase 7 清理 Beta 的 Windows 受控验收。**四道门禁在本机全绿**：
+
+| 门禁 | 2026-10-24 基线 | 2026-10-28 结果 |
+| --- | --- | --- |
+| `cargo fmt --all --check` | 通过 | 通过 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **失败**（`unused_mut`） | **通过** |
+| `cargo test --workspace` | **失败**（临时目录泄漏、句柄未关） | **通过：185 项、0 失败、2 项默认忽略** |
+| `pnpm build:desktop` | 通过 | 通过 |
+| `pnpm test:desktop` | **失败**（symlink EPERM） | **通过：19 项** |
+
+修掉的 Windows 阻塞缺陷：`atomic_file.rs` 的 `mut` 收进 unix 分支；
+`MutableSqliteDb::drop` 先换内存连接再删目录；WorkBuddy 契约测试删目录前
+显式 `drop(db)`；前端回归改用 `junction`（免提权）。
+
+修掉的**跨平台**数据正确性缺陷（两端同时受影响）：
+
+- §8 占用口径：`allocated_bytes` 由 `None` 起算导致永远为 `None`，所有平台
+  的"分配大小"从未生效。本机修前 45/47 个会话类资源为 null，修后 0 个。
+  CLI golden 基线随之改用既有的 `<ALLOCATED>` 占位符。
+- 只读 SQLite 读取档位：`mode=ro` 打开缺 `-shm` 的 WAL 库**惰性成功**，
+  私有副本降级从不触发。现在打开后先跑一次真实查询验证可读，并在打开前
+  校验 SQLite 文件头，避免把非数据库文件读成空库。
+- 独占归属：`is_single_link_file` 在所有非 unix 平台恒为 `false`，Windows 上
+  **没有任何会话能被证明独占**，因而永远产不出清理单元。现在读取
+  `BY_HANDLE_FILE_INFORMATION.nNumberOfLinks`（Windows 的 `st_nlink`）。
+
+Mac 同步（消除平台门禁）：
+
+- Antigravity 在 Windows 接入：状态根、索引与三棵已验证目录与 macOS 同构，
+  投影查询原样可跑；12 条索引、760 个资源。两处真实差异已有回归——
+  Windows 样本的 `title` 全为空（降级为"无标题"，不显示空白标题），
+  `workspace_uris` 带盘符（`file:///c%3A/...` → `c:\...`）。
+- Pi 在 Windows **保持关闭**：本机没有安装、没有任何样本，按红线"先有样本
+  再改代码"不得照抄 macOS 路径。
+- 去掉 macOS-only 门禁：CLI 新 Provider 端到端用例（Antigravity 在 Windows
+  跑，Pi 忽略）与 Application 本机只读探针现在两端共用。
+
+Phase 7 受控验收（Windows，本机）：
+
+- **原生回收站往返**：Recycle Bin 的 `$I`/`$R` 结构与 macOS Trash 不同
+  （原名不保留，原路径存在 `$I` 元数据里），新增
+  `crates/infrastructure/src/windows_acceptance.rs` 证明文件、嵌套目录、
+  空格、中文、引号路径的真实往返，identity 与字节内容不变。
+- **完整 Beta 闭环**：新增 `crates/application/src/tests/cleanup_acceptance.rs`，
+  在隔离 home 下铺出真实布局与真实 SQLite 的合成 WorkBuddy 安装，走完
+  发现 → 计划 → 重验 → 移入真实回收站 → 幂等重跑 → 手动恢复并逐字节核对。
+  全程只动自己唯一命名的临时样本。
+- 本机只读快照：5 个安装、57 个会话（Claude Code CLI 1 + Desktop 1、
+  Codex 2、WorkBuddy 41、Antigravity 12）。WorkBuddy 因此在 Windows 上
+  产出 41 个可评估单元（修复前为 0）。
+
+场景记录见 [`testing/windows-scenarios.md`](./testing/windows-scenarios.md)；
+完整计划与批次划分见 [`windows-parity-plan.md`](./windows-parity-plan.md)。
+
+## 2026-10-24 Windows 对齐 macOS 计划（历史基线）
 
 - 在 Windows 开发机实测三道门禁并留存证据：`cargo fmt --all --check` 通过；
   `cargo clippy --workspace --all-targets -- -D warnings` **失败**（`atomic_file.rs`

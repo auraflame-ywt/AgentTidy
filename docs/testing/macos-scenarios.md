@@ -18,7 +18,7 @@
 | 真实只读快照 | 3 个安装、354 个会话 | Claude Code 26、Codex 19、WorkBuddy 309；数量和运行状态会变化 |
 | 本机只读 opt-in / 严格 Trash 恢复 | 较早阶段分别显式通过 | 使用临时样本；后续品牌升级未重跑严格 Trash，不计入 165 项 |
 | Codex 完整清理与恢复 | 未验收，生产清理 Blocked | native delete 与 DB 替换均关闭；仅支持候选预览 |
-| Windows / 跨卷恢复 / 发行包体验 | 未在本轮验证 | 不从 Mac 结果推导通过 |
+| Windows 验收 | **已单独推进并完成**（2026-10-28） | 见 [windows-scenarios.md](./windows-scenarios.md)；Windows 的结论不由此页推导 |
 
 汇总和后续顺序见 [项目进度](../CHANGELOG.md)。
 下文保留分阶段证据；153/159/162 等早期测试数量不是最新基线。
@@ -143,3 +143,14 @@ pnpm build:desktop
 - 未关闭用户正在运行的 Agent，因此未对真实会话执行清理；确认弹窗键盘交互
   已实现，完整原生点击到执行闭环仍需使用受控 Provider 样本验收。
 - Windows 验收后续单独推进，不由本机结果推断。
+
+## Windows 后续进展（2026-10-28）
+
+Windows 端已在自己的页面上完成验收，四道门禁全绿，并补齐了 Windows
+特有的原生回收站往返与受控清理闭环；详见
+[windows-scenarios.md](./windows-scenarios.md)。本页的 macOS 结论仍然
+只代表 macOS，两页互不推导。
+
+本轮跨平台同步也影响 macOS：占用口径（§8 分配大小）此前在**两个平台**
+都是恒为 null，现已修复；只读 SQLite 的惰性打开降级同样在两个平台修复。
+因此 macOS 上"分配大小恒为 null"的历史描述已过期。

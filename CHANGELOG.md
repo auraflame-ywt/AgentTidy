@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The Windows desktop app runs and packages.** The app starts on
+  Windows, shows the real scan state, and renders the overview, session
+  list, review and diagnostics views against actual local data. Both
+  Windows installers build: an NSIS setup executable and an MSI.
+- **Windows support reaches the Mac feature level.** The five read-only
+  providers are now discoverable on Windows where a real sample exists:
+  Antigravity joins Claude Code (CLI/Desktop), Codex and WorkBuddy. The
+  Antigravity state root, index database and its three verified trees are
+  structurally identical to the macOS sample, and the adapter's projection
+  query runs unchanged against the Windows database.
+- **Windows native cleanup acceptance.** A strict Recycle Bin round-trip
+  test proves that a file, a nested directory and paths containing spaces,
+  CJK characters and quotes survive a real trash move and a manual restore,
+  with the file identity and the bytes unchanged. The Windows Recycle Bin
+  keeps the original path inside its `$I` metadata file rather than the
+  file name, and the test reads it from there.
+- **A controlled Phase 7 cleanup acceptance on real files.** A synthetic
+  provider installation — real directory layout, real database, real files —
+  is driven through the whole loop: discovery, planning, revalidation,
+  execution into the real OS trash, an idempotent re-run and a manual
+  restore with a byte-for-byte check. It only ever touches its own
+  uniquely named sample.
+- A Windows scenario page recording this machine's own results, kept
+  deliberately separate from the macOS one: a macOS result is never
+  reported as a Windows result.
+
+### Fixed
+
+- **Windows CI is green again.** Four platform-specific defects failed the
+  Windows job: a `mut` binding that only unix needed (breaking clippy),
+  a temporary database directory that could not be deleted while the
+  connection still held a file lock, a provider contract test that
+  deleted its fixture before closing the handle, and a frontend test that
+  needed a directory symlink — Windows now uses a junction, which needs
+  no elevation.
+- **Allocated size is reported again, on every platform.** The usage
+  accumulator started from "unknown", so the first measurement collapsed
+  it back to "unknown" and the allocated-size figure was never reported for
+  any scope. A fully measured scope now reports its allocated total, and a
+  single unmeasurable file still makes the total unknown.
+- **Read-only SQLite picks the right access tier.** Opening a WAL database
+  whose shared-memory file is missing used to succeed lazily — the failure
+  only appeared on the first real statement, so the private-copy fallback
+  never ran and providers silently skipped their inference. The open is
+  now verified before it is handed out, and a file that is not a database
+  is rejected instead of being read as an empty one.
+- **Exclusive ownership is provable on Windows.** Hard-link count was
+  unreadable outside unix, so no Windows session could ever be proven
+  exclusively owned and no cleanup unit could be built. Windows now reads
+  the link count natively.
+- **Windows workspace URIs decode correctly.** A workspace URI with a
+  drive letter (`file:///c%3A/...`) now resolves to a usable Windows path,
+  and an empty session title degrades to "no title" instead of rendering
+  blank.
+
+### Added
+
 - macOS read-only Antigravity and Pi adapters, grounded in local metadata samples:
   discovery, session/project listing, file usage and diagnostics through the shared
   API, CLI and desktop. Antigravity multi-root associations remain visible without
