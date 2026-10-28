@@ -47,7 +47,7 @@
           "provider": "workbuddy",
           "session_id": null,
           "size": {
-            "allocated_bytes": null,
+            "allocated_bytes": "<ALLOCATED>",
             "confidence": "exact",
             "exclusive_bytes": 0,
             "logical_bytes": 0,

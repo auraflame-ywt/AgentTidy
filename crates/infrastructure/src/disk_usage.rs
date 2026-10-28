@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use crate::fs_probe::{EntryInfo, EntryKind, FileIdentity};
 
 /// Accumulates file sizes, deduplicating hard links by identity.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UsageAccumulator {
     seen: HashSet<FileIdentity>,
     /// Bytes counted (deduped) — logical file lengths.
@@ -35,6 +35,28 @@ pub struct UsageAccumulator {
     unidentifiable_files: u64,
     /// Total files offered to the accumulator.
     files_seen: u64,
+}
+
+impl Default for UsageAccumulator {
+    /// Hand-written because the derived default would start
+    /// `allocated_bytes` at `None`, and the first accumulation
+    /// `opt_add_for_usage(None, Some(x))` would collapse to `None`
+    /// again — so the allocated total could never leave `None` no
+    /// matter how many measurable files were added (§8 "allocated
+    /// size" would never be reported). Starting at `Some(0)` keeps the
+    /// intended rule intact: the total stays known while every
+    /// contribution is measurable, and drops to `None` as soon as one
+    /// is not.
+    fn default() -> Self {
+        Self {
+            seen: HashSet::new(),
+            logical_bytes: 0,
+            allocated_bytes: Some(0),
+            hardlink_duplicates_skipped: 0,
+            unidentifiable_files: 0,
+            files_seen: 0,
+        }
+    }
 }
 
 impl UsageAccumulator {
@@ -109,7 +131,7 @@ impl OptAddUsage for Option<u64> {
 
 /// Final per-scope disk usage (a provider's translation layer maps this
 /// onto [`agenttidy_core::size::SizeInfo`]; core types stay untouched).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskUsage {
     /// Deduplicated sum of file logical lengths.
     pub logical_bytes: u64,
@@ -121,6 +143,22 @@ pub struct DiskUsage {
     pub hardlink_duplicates_skipped: u64,
     /// Files counted without a provable identity (possible over-count).
     pub unidentifiable_files: u64,
+}
+
+impl Default for DiskUsage {
+    /// An empty scope has a *known* allocated size of zero — there is
+    /// no unmeasured contribution to make it unknown. The derived
+    /// default would report `None` and disagree with an empty
+    /// accumulator, which reports `Some(0)`.
+    fn default() -> Self {
+        Self {
+            logical_bytes: 0,
+            allocated_bytes: Some(0),
+            files_seen: 0,
+            hardlink_duplicates_skipped: 0,
+            unidentifiable_files: 0,
+        }
+    }
 }
 
 /// Convenience: aggregate the `File` entries of one walk outcome.
@@ -230,5 +268,64 @@ mod tests {
     #[test]
     fn empty_usage_is_zero() {
         assert_eq!(usage_of_entries(&[]), DiskUsage::default());
+    }
+
+    #[test]
+    fn fully_measurable_files_report_the_allocated_total() {
+        // Regression: `allocated_bytes` used to stay `None` forever,
+        // because the accumulator started at `None` and the first
+        // `opt_add_for_usage(None, Some(_))` collapsed back to `None`.
+        // A fully measurable scope must report its allocated total.
+        let mut acc = UsageAccumulator::new();
+        acc.add_file(&file_entry(
+            PathBuf::from("/x/a"),
+            100,
+            Some(FileIdentity {
+                volume: 1,
+                index: 1,
+            }),
+        ));
+        acc.add_file(&file_entry(
+            PathBuf::from("/x/b"),
+            250,
+            Some(FileIdentity {
+                volume: 1,
+                index: 2,
+            }),
+        ));
+
+        let usage = acc.finish();
+        assert_eq!(usage.logical_bytes, 350);
+        assert_eq!(usage.allocated_bytes, Some(350));
+    }
+
+    #[test]
+    fn a_single_unmeasured_file_drops_the_allocated_total_to_none() {
+        // The complementary rule: one unmeasurable contribution must
+        // make the whole allocated total unknown (§8, no fake
+        // precision) — but it must not make it unknown *by default*.
+        let mut acc = UsageAccumulator::new();
+        acc.add_file(&file_entry(
+            PathBuf::from("/x/a"),
+            100,
+            Some(FileIdentity {
+                volume: 1,
+                index: 1,
+            }),
+        ));
+        let mut unmeasured = file_entry(
+            PathBuf::from("/x/b"),
+            20,
+            Some(FileIdentity {
+                volume: 1,
+                index: 2,
+            }),
+        );
+        unmeasured.allocated_len = None;
+        acc.add_file(&unmeasured);
+
+        let usage = acc.finish();
+        assert_eq!(usage.logical_bytes, 120);
+        assert_eq!(usage.allocated_bytes, None);
     }
 }

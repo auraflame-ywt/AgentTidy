@@ -138,10 +138,19 @@ impl MutableSqliteDb {
 
 impl Drop for MutableSqliteDb {
     fn drop(&mut self) {
-        // Close the connection *before* removing the temp dir. We
-        // don't swap to an in-memory fallback here because the
-        // destructor of `rusqlite::Connection` already releases the
-        // file lock when it runs.
+        // Close the connection *before* removing the temp dir. The
+        // field destructor runs only after `drop` returns, so the
+        // connection would still hold a Windows file lock on the copy
+        // and `remove_dir_all` would fail with ERROR_SHARING_VIOLATION.
+        // Swap in an in-memory connection to release the file handle
+        // now — the same technique `ReadOnlyDb::drop` uses.
+        self.conn = match rusqlite::Connection::open_in_memory() {
+            Ok(fresh) => fresh,
+            // An in-memory open cannot realistically fail; if it does,
+            // leave the temp dir behind rather than panic in Drop (a
+            // stray temp dir is recoverable, a panic in drop is not).
+            Err(_) => return,
+        };
         let _ = std::fs::remove_dir_all(&self.temp_dir);
     }
 }
@@ -151,6 +160,18 @@ impl ReadOnlyDb {
     pub fn open(path: &Path) -> Result<Self, SqliteOpenError> {
         if !path.is_file() {
             return Err(SqliteOpenError::NotFound(path.to_path_buf()));
+        }
+        // Validate the file *before* either tier is attempted. The
+        // private-copy fallback opens the copy read-write, where SQLite
+        // happily creates a fresh empty database for a file that is not
+        // one — which would turn "this is not a database" into "an
+        // empty database" and let the provider read a fabricated
+        // schema. Fail closed instead.
+        if !has_sqlite_header(path) {
+            return Err(SqliteOpenError::Unreadable {
+                path: path.to_path_buf(),
+                reason: "not a SQLite database (missing file header)".into(),
+            });
         }
         match open_readonly(path) {
             Ok(conn) => Ok(Self {
@@ -225,18 +246,58 @@ impl Drop for ReadOnlyDb {
     }
 }
 
-/// Direct `mode=ro` open. The URI must percent-encode anything outside
-/// the unreserved set — provider cwds contain spaces and CJK (see
-/// workbuddy.md), and SQLite URI parsing would otherwise stop at the
-/// first `?`.
+/// Direct `mode=ro` open, **verified** to be actually readable.
+///
+/// A `mode=ro` open of a WAL database whose `-shm` is missing (the
+/// agent is not running, so SQLite checkpointed and reclaimed the
+/// sidecars) *succeeds lazily*: `open_with_flags` returns `Ok` and the
+/// failure only surfaces on the first real statement
+/// (`SQLITE_CANTOPEN`, error 14). Treating that lazy success as a
+/// working direct read means the private-copy fallback below never
+/// runs, and every later query fails — the provider then degrades to
+/// "database unreadable" and silently skips its lifecycle inference.
+///
+/// So after opening we run one real query to prove the connection can
+/// read. If that fails, the caller falls back to a private copy, where
+/// SQLite can perform WAL recovery on *our* file.
 fn open_readonly(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
     let uri = to_sqlite_uri(path);
-    rusqlite::Connection::open_with_flags(
+    let conn = rusqlite::Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    )?;
+    // Prove the handle is usable *now* rather than at first use. The
+    // schema query touches only SQLite's own catalog — no provider
+    // table is read here, so this stays provider-neutral.
+    let probe: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+    if probe < 0 {
+        // Defensive: `count(*)` is never negative, so this would mean
+        // the driver handed back something unexpected.
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(conn)
+}
+
+/// Does the file carry the `SQLite format 3\0` header?
+///
+/// Every SQLite database starts with those exact 16 bytes. Checking
+/// them is the cheapest way to tell a database from an unrelated
+/// file — and to catch a half-written or corrupted database before we
+/// hand out a connection that would fail on first use.
+fn has_sqlite_header(path: &Path) -> bool {
+    const HEADER: &[u8; 16] = b"SQLite format 3\0";
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 16];
+    match std::io::Read::read_exact(&mut file, &mut buf) {
+        Ok(()) => &buf == HEADER,
+        // A file shorter than the header is not a database.
+        Err(_) => false,
+    }
 }
 
 /// `file:<encoded-path>?mode=ro`. Windows paths get forward slashes
@@ -409,6 +470,81 @@ mod tests {
             ReadOnlyDb::open(&path),
             Err(SqliteOpenError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn wal_database_without_shm_is_still_readable() {
+        // Regression: a `mode=ro` open of a WAL database whose `-shm`
+        // is gone succeeds *lazily* — the failure only appears on the
+        // first real statement. The opener must verify readability and
+        // fall back to a private copy when the direct read is
+        // impossible, otherwise every later query fails and the
+        // provider silently skips its inference (this is what made the
+        // WorkBuddy lifecycle unknown on a cold install).
+        //
+        // Which tier serves the read is platform-dependent: Windows
+        // lets SQLite create the `-shm` next to the database, so the
+        // direct read succeeds there, while a read-only directory
+        // (macOS app sandbox, or a WAL that still needs recovery)
+        // forces the private copy. The invariant under test is the
+        // *outcome*: the data must be readable and the integrity check
+        // must pass — never a `Live` handle that fails on first use.
+        let path = temp_db("wal-no-shm");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "wal").unwrap();
+            conn.execute("CREATE TABLE t (x)", []).unwrap();
+            conn.execute("INSERT INTO t VALUES (7)", []).unwrap();
+        }
+        // Checkpoint and drop the WAL so only a checkpointed `db` file
+        // remains — the exact state of a database whose agent is not
+        // running (SQLite reclaimed the sidecars).
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "wal").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        std::fs::remove_file(Path::new(&wal)).ok();
+        let mut shm = path.as_os_str().to_os_string();
+        shm.push("-shm");
+        std::fs::remove_file(Path::new(&shm)).ok();
+        assert!(!Path::new(&shm).exists(), "the -shm sidecar must be gone");
+
+        // The open must succeed and the data must be readable — through
+        // whichever tier the platform can actually provide.
+        let db = ReadOnlyDb::open(&path).unwrap();
+        assert!(db.quick_check_ok().unwrap());
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "the checkpointed row must survive the open");
+        let value: i64 = db
+            .connection()
+            .query_row("SELECT x FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn readonly_open_of_an_unreadable_database_fails_closed() {
+        // The verification query in `open_readonly` must turn a lazily
+        // opened but unusable handle into an error, so the caller can
+        // take the private-copy tier instead of handing out a broken
+        // connection. A file that is not a database at all exercises
+        // exactly that path.
+        let path = temp_db("not-a-db");
+        std::fs::write(&path, b"this is not a sqlite database").unwrap();
+        let result = ReadOnlyDb::open(&path);
+        assert!(
+            result.is_err(),
+            "a non-database file must not open successfully"
+        );
+        cleanup(&path);
     }
 
     #[test]

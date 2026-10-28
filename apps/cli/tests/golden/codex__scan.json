@@ -72,7 +72,7 @@
           "provider": "codex",
           "session_id": null,
           "size": {
-            "allocated_bytes": null,
+            "allocated_bytes": "<ALLOCATED>",
             "confidence": "exact",
             "exclusive_bytes": null,
             "logical_bytes": 0,

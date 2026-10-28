@@ -17,8 +17,29 @@
 | Phase 5：GUI Read-only Experience | 已完成，Mac 体验已优化 | 总览、会话搜索/筛选/详情、诊断已接入共享 API；已补齐占用排行、品牌图标、启动页与中英文展示。 |
 | Phase 6：Cleanup Model | 已完成，执行框架已加固 | 计划、TTL、完整证据重验、跨进程锁、审计、IPC 与两次确认已落地；具体资源清理资格及恢复验收归 Phase 7。 |
 | Phase 7：首个 Provider Cleanup Beta | 进行中（Mac 体验与安全加固已落地） | Claude Code / WorkBuddy FileSet Beta 已实现；Codex 仅保留 Blocked 候选，native delete 与 DB 替换均关闭。剩余：受控完整闭环、真实用户 Beta 与跨平台恢复/兼容性验收。 |
-| Phase 8：逐 Provider 扩展 | 已开始（Mac 只读） | Antigravity / Pi 会话、项目、占用与诊断已接入；清理/归档/恢复和 Windows 等待各自安全门槛。 |
+| Phase 8：逐 Provider 扩展 | 已开始（Mac 只读，Windows 对齐进行中） | Antigravity / Pi 会话、项目、占用与诊断已接入；清理/归档/恢复和 Windows 等待各自安全门槛。 |
 
+## 2026-10-24 Windows 对齐 macOS 计划（最新状态）
+
+- 在 Windows 开发机实测三道门禁并留存证据：`cargo fmt --all --check` 通过；
+  `cargo clippy --workspace --all-targets -- -D warnings` **失败**（`atomic_file.rs`
+  在非 unix 分支的 `unused_mut`）；`cargo test --workspace` **失败**
+  （`MutableSqliteDb::drop` 未先关连接导致 Windows 删不掉临时目录；
+  WorkBuddy 契约测试在句柄未关时删目录）；`pnpm build:desktop` 通过；
+  `pnpm test:desktop` **失败**（前端回归用目录符号链接，Windows 需改 junction）。
+  CI 的 Windows job 目前是红的，Linux 独占的前端门禁掩盖了同类问题。
+- 只读 CLI 在本机可用：检出 `claude-code:cli`、`claude-code:desktop`、
+  `codex:default`、`workbuddy:default`，共 45 个会话。Antigravity 与 Pi 在
+  Windows 上被 `cfg(target_os = "macos")` 硬关闭。
+- 定位到两个跨平台数据正确性缺陷：占用聚合的 `allocated_bytes` 因初值为
+  `None` 而恒为 `None`（§8 分配大小从未生效）；只读 SQLite 的 `mode=ro` 打开
+  在 WAL 库缺 `-shm` 时**惰性成功**，导致不落到私有副本降级，
+  WorkBuddy 生命周期推断被跳过（41 个会话全部 `unknown`，
+  Phase 7 的 WorkBuddy FileSet Beta 在 Windows 上产出 0 个可执行单元）。
+- Windows 侧本机已有 Antigravity 真实样本（`%USERPROFILE%\.gemini\antigravity`，
+  与 macOS 同构，投影查询原样可跑），Pi 未安装。Claude Desktop 存在未被扫描的
+  `claude-code-sessions\` 新目录树。
+- 完整计划、证据与批次划分见 [`windows-parity-plan.md`](./windows-parity-plan.md)。
 ## 2026-10-21 Antigravity / Pi 扩展（最新状态）
 
 - 基于本机真实样本新增两个静态 Provider，贯通 Rust Application API、CLI 与桌面。

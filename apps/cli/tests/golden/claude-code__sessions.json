@@ -23,7 +23,7 @@
         }
       ],
       "size": {
-        "allocated_bytes": null,
+        "allocated_bytes": "<ALLOCATED>",
         "confidence": "exact",
         "exclusive_bytes": 1367,
         "logical_bytes": 1367,

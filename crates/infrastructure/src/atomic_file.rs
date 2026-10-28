@@ -9,23 +9,39 @@ use std::{
 };
 
 pub fn create_private_directory(path: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
+    // The `mut` binding is only needed on unix, where `mode()` takes
+    // `&mut self`. Binding it separately per platform keeps the
+    // Windows build free of an `unused_mut` warning, which CI treats
+    // as an error (`-D warnings`).
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
+        builder.create(path)
     }
-    builder.create(path)
+    #[cfg(not(unix))]
+    {
+        fs::DirBuilder::new().create(path)
+    }
 }
 pub fn create_private_file(path: &Path) -> io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
+    // Same platform split as `create_private_directory`: only unix
+    // needs `mut` for the `mode()` call.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
         options.mode(0o600);
+        options.open(path)
     }
-    options.open(path)
+    #[cfg(not(unix))]
+    {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        options.open(path)
+    }
 }
 struct Staged(PathBuf);
 impl Drop for Staged {

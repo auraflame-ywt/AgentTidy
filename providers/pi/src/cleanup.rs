@@ -205,7 +205,6 @@ mod tests {
         fs::rename(original, &path).unwrap();
         path
     }
-    #[cfg(unix)]
     #[tokio::test]
     async fn single_transcript_forms_a_reviewable_trash_unit_and_rejects_forgery() {
         let sample = Sample::new();
@@ -235,7 +234,6 @@ mod tests {
             "size/mtime drift must invalidate the unit"
         );
     }
-    #[cfg(unix)]
     #[test]
     fn external_hardlink_and_duplicate_ids_cannot_become_units() {
         let sample = Sample::new();

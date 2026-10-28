@@ -997,6 +997,11 @@ mod tests {
             !WorkBuddyAdapter::sessions_contract_holds(&db),
             "drifted table must fail the contract check"
         );
+        // Close the database handle *before* removing the directory:
+        // on Windows an open SQLite connection keeps a file lock on
+        // `workbuddy.db`, and `remove_dir_all` would fail with
+        // ERROR_SHARING_VIOLATION (error 32).
+        drop(db);
         fs::remove_dir_all(root).unwrap();
     }
 

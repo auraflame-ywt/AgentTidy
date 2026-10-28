@@ -37,7 +37,7 @@
           "provider": "claude-code",
           "session_id": "9521178d-ae3a-4959-b9ac-7591e7eaf5d6",
           "size": {
-            "allocated_bytes": null,
+            "allocated_bytes": "<ALLOCATED>",
             "confidence": "exact",
             "exclusive_bytes": 1367,
             "logical_bytes": 1367,
@@ -70,7 +70,7 @@
             }
           ],
           "size": {
-            "allocated_bytes": null,
+            "allocated_bytes": "<ALLOCATED>",
             "confidence": "exact",
             "exclusive_bytes": 1367,
             "logical_bytes": 1367,

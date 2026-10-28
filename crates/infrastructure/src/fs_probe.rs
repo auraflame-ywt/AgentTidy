@@ -334,10 +334,66 @@ pub fn is_single_link_file(path: &Path) -> bool {
         std::fs::symlink_metadata(path)
             .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.nlink() == 1)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Windows exposes the same fact as `nNumberOfLinks` in
+        // `BY_HANDLE_FILE_INFORMATION`. Without this the platform could
+        // never *prove* a transcript is exclusively owned, which would
+        // fail every cleanup unit closed — the same fact unix reads
+        // from `st_nlink`.
+        windows_link_count(path) == Some(1)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         false
+    }
+}
+
+/// Number of hard links pointing at `path`, or `None` when the fact
+/// cannot be read (locked file, race with deletion).
+#[cfg(windows)]
+fn windows_link_count(path: &Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    // SAFETY: all pointers below are valid; the handle is closed on
+    // every path. OPEN_REPARSE_POINT opens the link itself so a
+    // symlink/junction is reported by its own attributes rather than
+    // its target's (matching the non-following walk, §16.1).
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        // All-POD Win32 struct; zero-init is the canonical zero value.
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let ok = GetFileInformationByHandle(handle, &mut info);
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        // A reparse point is a link, never an exclusively-owned file.
+        if info.dwFileAttributes & 0x400 != 0 {
+            return None;
+        }
+        Some(info.nNumberOfLinks)
     }
 }
 
