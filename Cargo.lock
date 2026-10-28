@@ -40,6 +40,7 @@ dependencies = [
  "agenttidy-workbuddy",
  "anyhow",
  "async-trait",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

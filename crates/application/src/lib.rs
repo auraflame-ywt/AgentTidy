@@ -2391,4 +2391,9 @@ mod tests {
     // Tests for fresh IPC instances and execution-time safety use a deterministic
     // provider, so real running agents never mask a dispatch regression (§18).
     mod live;
+
+    // Controlled acceptance on real files: a synthetic provider
+    // installation is moved to the real OS trash and restored by hand
+    // (§18.3/§18.4). Opt-in, because it needs the OS trash.
+    mod cleanup_acceptance;
 }

@@ -34,3 +34,5 @@ pub mod workspace_safety;
 // uniquely named samples. Ordinary CI cannot certify native recovery (§18.4).
 #[cfg(all(test, target_os = "macos"))]
 mod macos_acceptance;
+#[cfg(all(test, target_os = "windows"))]
+mod windows_acceptance;
